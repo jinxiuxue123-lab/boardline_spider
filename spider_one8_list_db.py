@@ -45,6 +45,10 @@ HTTP_SESSION.headers.update(
     {
         "User-Agent": "Mozilla/5.0",
         "Referer": BASE_URL,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
     }
 )
 
@@ -63,6 +67,14 @@ def sleep_between_categories() -> None:
     delay = random.uniform(CATEGORY_SLEEP_MIN_SECONDS, CATEGORY_SLEEP_MAX_SECONDS)
     print(f"分类间隔休眠: {delay:.1f}s")
     time.sleep(delay)
+
+
+def warmup_one8_session(session: requests.Session) -> None:
+    try:
+        session.get(BASE_URL, timeout=PAGE_REQUEST_TIMEOUT_SECONDS)
+        time.sleep(random.uniform(1.0, 2.0))
+    except Exception:
+        pass
 
 
 def upsert_one8_product_update_with_change_log(
@@ -608,12 +620,26 @@ def make_page_url(url: str, page_num: int) -> str:
 
 
 def fetch_category_html(session: requests.Session, current_url: str) -> str:
-    response = session.get(
-        current_url,
-        timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    return response.text
+    last_error = None
+    for attempt in range(1, PAGE_REQUEST_RETRIES + 1):
+        try:
+            if attempt == 1:
+                warmup_one8_session(session)
+            response = session.get(
+                current_url,
+                timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
+                headers={"Referer": BASE_URL + "/"},
+            )
+            response.raise_for_status()
+            return response.text
+        except Exception as e:
+            last_error = e
+            if attempt < PAGE_REQUEST_RETRIES:
+                print(f"分类页请求重试 {attempt}/{PAGE_REQUEST_RETRIES - 1}: {current_url} | {e}")
+                time.sleep(random.uniform(2.0, 4.0))
+                warmup_one8_session(session)
+                continue
+    raise last_error or RuntimeError(f"请求失败: {current_url}")
 
 
 def extract_product_items_from_html(html: str):
