@@ -201,9 +201,30 @@ class BoardlineListParser(HTMLParser):
             self._name_parts.append(data)
 
 
+def extract_main_product_list_html(html_text):
+    html_text = html_text or ""
+
+    content_wrap_match = re.search(
+        r'<div id="contentWrap".*</body>',
+        html_text,
+        flags=re.I | re.S,
+    )
+    search_html = content_wrap_match.group(0) if content_wrap_match else html_text
+
+    list_matches = re.findall(
+        r'<div class="prd-list[^"]*".*?</table>',
+        search_html,
+        flags=re.I | re.S,
+    )
+    if list_matches:
+        return list_matches[-1]
+
+    return search_html
+
+
 def extract_product_cards(html_text):
     parser = BoardlineListParser()
-    parser.feed(html_text or "")
+    parser.feed(extract_main_product_list_html(html_text))
     return parser.products
 
 
