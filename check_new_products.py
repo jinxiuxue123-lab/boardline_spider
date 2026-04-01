@@ -8,8 +8,17 @@ from db_utils import get_product_by_branduid
 BASE_URL = "http://www.boardline.co.kr"
 CHECK_TOP_N = 20
 PLAYWRIGHT_HEADLESS = (os.getenv("PLAYWRIGHT_HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
-PAGE_GOTO_TIMEOUT_MS = 60000
+PAGE_GOTO_TIMEOUT_MS = 30000
 PAGE_GOTO_RETRIES = 3
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCKED_URL_KEYWORDS = (
+    "google-analytics",
+    "googletagmanager",
+    "doubleclick",
+    "facebook.net",
+    "analytics",
+    "gtag/js",
+)
 
 
 def extract_branduid(url):
@@ -31,6 +40,13 @@ def get_product_cells(page):
             cells.append(cell)
 
     return cells
+
+
+def should_block_request(request) -> bool:
+    if request.resource_type in BLOCKED_RESOURCE_TYPES:
+        return True
+    lowered_url = request.url.lower()
+    return any(keyword in lowered_url for keyword in BLOCKED_URL_KEYWORDS)
 
 
 def check_category_first_page(page, category_name, category_url):
@@ -94,6 +110,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
         page = browser.new_page()
+        page.route("**/*", lambda route: route.abort() if should_block_request(route.request) else route.continue_())
 
         for _, row in categories_df.iterrows():
             category_name = str(row["name"]).strip() if pd.notna(row["name"]) else ""
