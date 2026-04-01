@@ -584,20 +584,20 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
             sleep_between_pages()
         try:
             print(f"打开页面: {current_url}")
-            page.goto(current_url, timeout=45000, wait_until="domcontentloaded")
+            page.goto(current_url, timeout=25000, wait_until="commit")
         except Exception as e:
             print(f"页面加载异常，重试一次: {current_url} | {e}")
             try:
                 sleep_between_pages()
                 print(f"重新打开页面: {current_url}")
-                page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
+                page.goto(current_url, timeout=20000, wait_until="commit")
             except Exception as retry_error:
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
         try:
             print("等待商品列表选择器...")
-            page.wait_for_selector("ul.prdList, .ec-base-product", timeout=15000)
-        except Exception:
-            pass
+            page.wait_for_selector("ul.prdList > li, .ec-base-product ul.prdList > li, li[id^='anchorBoxId_']", timeout=20000)
+        except Exception as e:
+            raise CategoryPageLoadError(f"{current_url} | 商品列表未就绪: {e}") from e
         page.wait_for_timeout(800)
 
         product_items = extract_product_items(page)
