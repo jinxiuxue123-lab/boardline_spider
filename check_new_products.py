@@ -8,6 +8,8 @@ from db_utils import get_product_by_branduid
 BASE_URL = "http://www.boardline.co.kr"
 CHECK_TOP_N = 20
 PLAYWRIGHT_HEADLESS = (os.getenv("PLAYWRIGHT_HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
+PAGE_GOTO_TIMEOUT_MS = 60000
+PAGE_GOTO_RETRIES = 3
 
 
 def extract_branduid(url):
@@ -35,8 +37,22 @@ def check_category_first_page(page, category_name, category_url):
     print(f"\n检查分类: {category_name}")
     print(f"分类地址: {category_url}")
 
-    page.goto(category_url, timeout=60000)
-    page.wait_for_timeout(3000)
+    last_error = None
+    for attempt in range(1, PAGE_GOTO_RETRIES + 1):
+        try:
+            page.goto(category_url, timeout=PAGE_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            page.wait_for_timeout(3000)
+            last_error = None
+            break
+        except Exception as exc:
+            last_error = exc
+            print(f"分类首屏加载失败，重试 {attempt}/{PAGE_GOTO_RETRIES}: {category_name} | {exc}")
+            if attempt == PAGE_GOTO_RETRIES:
+                raise
+            page.wait_for_timeout(2000)
+
+    if last_error is not None:
+        raise last_error
 
     cells = get_product_cells(page)
     checked = 0
