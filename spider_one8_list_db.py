@@ -767,7 +767,10 @@ def main():
                 start_index = idx
                 break
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=not args.headed)
+        browser = p.chromium.launch(
+            headless=not args.headed,
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
+        )
         context = browser.new_context()
         page = context.new_page()
         page.set_default_navigation_timeout(45000)
