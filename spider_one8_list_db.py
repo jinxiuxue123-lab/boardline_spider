@@ -36,6 +36,8 @@ CATEGORY_SLEEP_MIN_SECONDS = 5.0
 CATEGORY_SLEEP_MAX_SECONDS = 8.0
 OPTION_REQUEST_TIMEOUT_SECONDS = 12
 IMAGE_REQUEST_TIMEOUT_SECONDS = 8
+ONE8_MAIN_LIST_SELECTOR = ".xans-product.xans-product-normalpackage .xans-product-listnormal ul.prdList.grid5"
+ONE8_MAIN_ITEM_SELECTOR = f"{ONE8_MAIN_LIST_SELECTOR} > li[id^='anchorBoxId_']"
 
 
 class CategoryPageLoadError(Exception):
@@ -497,9 +499,9 @@ def make_page_url(url: str, page_num: int) -> str:
 
 def extract_product_items(page):
     selectors = [
-        "div.right ul.prdList > li[id^='anchorBoxId_']",
-        ".ec-base-product ul.prdList > li[id^='anchorBoxId_']",
-        "ul.prdList > li[id^='anchorBoxId_']",
+        ONE8_MAIN_ITEM_SELECTOR,
+        ".xans-product-listnormal ul.prdList.grid5 > li[id^='anchorBoxId_']",
+        ".xans-product-listnormal ul.prdList > li[id^='anchorBoxId_']",
     ]
     for selector in selectors:
         items = page.query_selector_all(selector)
@@ -513,6 +515,9 @@ def extract_product_from_item(item, cate_no: str):
     if not link:
         return None
     href = (link.get_attribute("href") or "").strip()
+    # one8 列表页顶部有推荐区，推荐商品通常是 display/2；这里只保留正式列表商品。
+    if "/display/2/" in href:
+        return None
     branduid, product_url = normalize_product_url(href)
     if not branduid or not product_url:
         return None
@@ -596,14 +601,18 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
         try:
             print("等待商品列表选择器...")
-            page.wait_for_selector("ul.prdList > li, .ec-base-product ul.prdList > li, li[id^='anchorBoxId_']", timeout=20000)
+            page.wait_for_selector(
+                ONE8_MAIN_ITEM_SELECTOR,
+                timeout=20000,
+                state="attached",
+            )
         except Exception as e:
             raise CategoryPageLoadError(f"{current_url} | 商品列表未就绪: {e}") from e
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(1500)
 
         product_items = extract_product_items(page)
-        product_links = page.query_selector_all("ul.prdList a[href*='/product/']")
-        print(f"调试: prdList商品项={len(product_items)} | product链接={len(product_links)} | url={current_url}")
+        product_links = page.query_selector_all(f"{ONE8_MAIN_LIST_SELECTOR} a[href*='/product/']")
+        print(f"调试: 主列表商品项={len(product_items)} | 主列表链接={len(product_links)} | url={current_url}")
         if not product_items:
             break
 
