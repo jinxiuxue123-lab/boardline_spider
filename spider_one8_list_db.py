@@ -72,6 +72,34 @@ def save_debug_artifacts(page, category_name: str, page_num: int, stage: str) ->
         print(f"保存调试截图失败: {e}")
 
 
+def wait_for_product_markup(page, timeout_ms: int = 60000, interval_ms: int = 3000) -> bool:
+    deadline = time.time() + (timeout_ms / 1000)
+    page.wait_for_selector("body", timeout=min(timeout_ms, 15000))
+    round_no = 0
+    while time.time() < deadline:
+        round_no += 1
+        try:
+            html = page.content()
+        except Exception:
+            html = ""
+
+        if "anchorBoxId_" in html:
+            print(f"检测到商品标记: anchorBoxId_ | round={round_no}")
+            return True
+        if 'class="prdList' in html or "class='prdList" in html:
+            print(f"检测到列表标记: prdList | round={round_no}")
+            return True
+
+        try:
+            item_count = page.locator("li[id^='anchorBoxId_']").count()
+        except Exception:
+            item_count = 0
+        print(f"等待商品标记中: round={round_no} | dom_item_count={item_count}")
+        page.wait_for_timeout(interval_ms)
+
+    return False
+
+
 def upsert_one8_product_update_with_change_log(
     *,
     product_id: int,
@@ -615,8 +643,10 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
                 save_debug_artifacts(page, category_name, page_num, "goto_failed")
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
         try:
-            print("等待商品列表选择器...")
-            page.wait_for_selector("ul.prdList > li, .ec-base-product ul.prdList > li, li[id^='anchorBoxId_']", timeout=20000)
+            print("等待商品列表标记...")
+            ready = wait_for_product_markup(page, timeout_ms=60000, interval_ms=3000)
+            if not ready:
+                raise TimeoutError("60秒内未检测到 prdList 或 anchorBoxId_")
         except Exception as e:
             save_debug_artifacts(page, category_name, page_num, "wait_failed")
             raise CategoryPageLoadError(f"{current_url} | 商品列表未就绪: {e}") from e
