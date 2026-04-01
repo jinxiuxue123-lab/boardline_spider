@@ -1,18 +1,22 @@
-#!/bin/zsh
+#!/bin/bash
 set -euo pipefail
 
-cd "$(dirname "$0")"
+PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
+PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+
+cd "$PROJECT_ROOT"
+export PLAYWRIGHT_HEADLESS="${PLAYWRIGHT_HEADLESS:-1}"
 
 echo "[1/4] 开始日常同步..."
-python3 daily_sync.py
+"$PYTHON_BIN" daily_sync.py
 
 echo "[2/4] 刷新折扣与人民币价格..."
-python3 refresh_discount_pricing.py
+"$PYTHON_BIN" refresh_discount_pricing.py
 
 echo "[3/4] 导出全量库存表..."
-python3 export_all_stock.py
+"$PYTHON_BIN" export_all_stock.py
 
 echo "[4/4] 刷新网页展示数据..."
-python3 generate_catalog_site.py
+"$PYTHON_BIN" generate_catalog_site.py
 
 echo "全部完成"

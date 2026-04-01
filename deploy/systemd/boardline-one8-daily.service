@@ -6,4 +6,4 @@ After=network.target
 Type=oneshot
 User=root
 WorkingDirectory=/root/boardline_spider
-ExecStart=/bin/zsh /root/boardline_spider/run_one8_daily.sh
+ExecStart=/bin/bash /root/boardline_spider/run_one8_daily.sh
