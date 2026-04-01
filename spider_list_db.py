@@ -1,8 +1,9 @@
-from playwright.sync_api import sync_playwright
 import pandas as pd
 import re
 import requests
 from datetime import datetime
+from html import unescape
+from html.parser import HTMLParser
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 from pathlib import Path
 import os
@@ -19,17 +20,12 @@ SOURCE_NAME = "boardline"
 TEST_LIMIT = None
 FAILED_PAGES_FILE = "failed_list_pages.txt"
 MAX_PAGE_RETRIES = 3
-PLAYWRIGHT_HEADLESS = (os.getenv("PLAYWRIGHT_HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
-PAGE_GOTO_TIMEOUT_MS = 30000
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-BLOCKED_URL_KEYWORDS = (
-    "google-analytics",
-    "googletagmanager",
-    "doubleclick",
-    "facebook.net",
-    "analytics",
-    "gtag/js",
-)
+PAGE_REQUEST_TIMEOUT_SECONDS = 15
+PAGE_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": BASE_URL,
+    "Connection": "close",
+}
 
 
 # ==========================
@@ -118,18 +114,67 @@ def make_page_url(url, page_num):
     ))
 
 
-def get_product_cells(page):
-    content_wrap = page.query_selector("#contentWrap")
-    if not content_wrap:
-        return []
+class BoardlineListParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.products = []
+        self._in_td = False
+        self._td_depth = 0
+        self._current = None
+        self._capture_name = False
+        self._name_parts = []
 
-    cells = []
-    for cell in content_wrap.query_selector_all("td"):
-        link_el = cell.query_selector("div.thumb a[href*='branduid=']")
-        if link_el:
-            cells.append(cell)
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        classes = attrs_dict.get("class", "")
+        if tag == "td":
+            self._in_td = True
+            self._td_depth += 1
+            if self._td_depth == 1:
+                self._current = {"href": "", "name": "", "image_url": ""}
+                self._name_parts = []
+                self._capture_name = False
+            return
 
-    return cells
+        if not self._in_td or not self._current:
+            return
+
+        if tag == "a":
+            href = attrs_dict.get("href", "")
+            if "branduid=" in href and not self._current["href"]:
+                self._current["href"] = href
+        elif tag == "img":
+            src = attrs_dict.get("src", "")
+            if src and not self._current["image_url"]:
+                self._current["image_url"] = src
+        elif tag == "li" and "dsc" in classes.split():
+            self._capture_name = True
+
+    def handle_endtag(self, tag):
+        if tag == "li" and self._capture_name:
+            self._capture_name = False
+            if self._current is not None:
+                self._current["name"] = clean_name("".join(self._name_parts))
+            self._name_parts = []
+            return
+
+        if tag == "td" and self._in_td:
+            self._td_depth -= 1
+            if self._td_depth == 0:
+                self._in_td = False
+                if self._current and self._current.get("href"):
+                    self.products.append(self._current)
+                self._current = None
+
+    def handle_data(self, data):
+        if self._capture_name:
+            self._name_parts.append(data)
+
+
+def extract_product_cards(html_text):
+    parser = BoardlineListParser()
+    parser.feed(html_text or "")
+    return parser.products
 
 
 def clear_failed_pages_file():
@@ -155,36 +200,32 @@ def load_failed_pages():
     return items
 
 
-def should_block_request(request) -> bool:
-    if request.resource_type in BLOCKED_RESOURCE_TYPES:
-        return True
-    lowered_url = request.url.lower()
-    return any(keyword in lowered_url for keyword in BLOCKED_URL_KEYWORDS)
-
-
-def open_page_with_retries(page, category_name, current_url, page_num):
+def open_page_with_retries(category_name, current_url, page_num):
     last_error = None
 
     for attempt in range(1, MAX_PAGE_RETRIES + 1):
         try:
             print(f"打开页面尝试 {attempt}/{MAX_PAGE_RETRIES}: {current_url}")
-            page.goto(current_url, timeout=PAGE_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
-            page.wait_for_timeout(1500)
-            return True
+            response = requests.get(
+                current_url,
+                headers=PAGE_REQUEST_HEADERS,
+                timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            return response.text
         except Exception as e:
             last_error = str(e)
             print(f"页面失败（第 {attempt} 次）: {e}")
-            page.wait_for_timeout(2000)
 
     append_failed_page(category_name, page_num, current_url, last_error or "unknown error")
     print(f"页面最终失败，已记录: {category_name} 第 {page_num} 页")
-    return False
+    return ""
 
 
 # ==========================
 # 抓分类
 # ==========================
-def crawl_category(page, category_url, category_name, remaining_limit=None):
+def crawl_category(category_url, category_name, remaining_limit=None):
     page_num = 1
     total_count = 0
 
@@ -195,26 +236,22 @@ def crawl_category(page, category_url, category_name, remaining_limit=None):
         current_url = make_page_url(category_url, page_num)
         print(f"\n抓取分类 [{category_name}] 第 {page_num} 页")
 
-        opened = open_page_with_retries(page, category_name, current_url, page_num)
-        if not opened:
+        html_text = open_page_with_retries(category_name, current_url, page_num)
+        if not html_text:
             page_num += 1
             continue
 
-        cells = get_product_cells(page)
-        if len(cells) == 0:
+        products = extract_product_cards(html_text)
+        if len(products) == 0:
             break
 
         page_count = 0
 
-        for cell in cells:
+        for item in products:
             if remaining_limit is not None and total_count >= remaining_limit:
                 break
 
-            link_el = cell.query_selector("div.thumb a")
-            if not link_el:
-                continue
-
-            href = link_el.get_attribute("href")
+            href = unescape((item.get("href") or "").strip())
             if not href:
                 continue
 
@@ -226,14 +263,9 @@ def crawl_category(page, category_url, category_name, remaining_limit=None):
 
             product_url = f"{BASE_URL}/shop/shopdetail.html?branduid={branduid}"
 
-            # 商品名称
-            name_el = cell.query_selector("li.dsc")
-            name = name_el.inner_text().strip() if name_el else ""
-            name = clean_name(name)
+            name = clean_name(item.get("name") or "")
 
-            # 图片
-            img_el = cell.query_selector("div.thumb img")
-            image_url = img_el.get_attribute("src") if img_el else ""
+            image_url = unescape((item.get("image_url") or "").strip())
 
             if image_url and image_url.startswith("/"):
                 image_url = BASE_URL + image_url
@@ -297,37 +329,29 @@ def main():
     total_processed = 0
     clear_failed_pages_file()
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
-        page = browser.new_page()
-        page.route("**/*", lambda route: route.abort() if should_block_request(route.request) else route.continue_())
+    for _, row in categories_df.iterrows():
+        if TEST_LIMIT is not None and total_processed >= TEST_LIMIT:
+            break
 
-        for _, row in categories_df.iterrows():
-            if TEST_LIMIT is not None and total_processed >= TEST_LIMIT:
-                break
+        category_name = str(row["name"]).strip()
+        category_url = str(row["url"]).strip()
 
-            category_name = str(row["name"]).strip()
-            category_url = str(row["url"]).strip()
+        if not category_url:
+            continue
 
-            if not category_url:
-                continue
+        print(f"\n开始分类: {category_name} | 当前累计: {total_processed}")
 
-            print(f"\n开始分类: {category_name} | 当前累计: {total_processed}")
+        remaining_limit = None
+        if TEST_LIMIT is not None:
+            remaining_limit = TEST_LIMIT - total_processed
 
-            remaining_limit = None
-            if TEST_LIMIT is not None:
-                remaining_limit = TEST_LIMIT - total_processed
-
-            category_total = crawl_category(
-                page,
-                category_url,
-                category_name,
-                remaining_limit=remaining_limit,
-            )
-            total_processed += category_total
-            print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
-
-        browser.close()
+        category_total = crawl_category(
+            category_url,
+            category_name,
+            remaining_limit=remaining_limit,
+        )
+        total_processed += category_total
+        print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
 
     print("\n全部完成")
 
