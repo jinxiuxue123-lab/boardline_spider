@@ -37,7 +37,7 @@ def count_non_empty_lines(path: str) -> int:
         return sum(1 for line in f if line.strip())
 
 
-def run_script(script_name, log_file=None):
+def run_script(script_name, log_file=None, continue_on_error: bool = False):
     log(f"\n开始执行: {script_name}", log_file)
     cmd = shlex.split(script_name)
     process = subprocess.Popen(
@@ -58,6 +58,9 @@ def run_script(script_name, log_file=None):
         log_file.flush()
 
     if process.returncode != 0:
+        if continue_on_error:
+            log(f"警告: {script_name} 执行失败，继续后续流程", log_file)
+            return
         raise RuntimeError(f"{script_name} 执行失败")
     log(f"执行完成: {script_name}", log_file)
 
@@ -150,7 +153,7 @@ def main():
         log(f"日志文件: {log_path}", log_file)
 
         log_step("1/8", "巡检新增商品", log_file)
-        run_script("check_new_products.py", log_file)
+        run_script("check_new_products.py", log_file, continue_on_error=True)
 
         log_step("2/8", "同步 Boardline 商品列表", log_file)
         run_script("spider_list_db.py", log_file)
