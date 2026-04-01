@@ -532,6 +532,10 @@ def debug_page_state(page, current_url: str) -> None:
     except Exception:
         body_text = ""
     try:
+        html_preview = clean_text((page.content() or "")[:800])
+    except Exception:
+        html_preview = ""
+    try:
         has_main_list = page.locator(".xans-product-listnormal").count() > 0
     except Exception:
         has_main_list = False
@@ -547,6 +551,8 @@ def debug_page_state(page, current_url: str) -> None:
     )
     if body_text:
         print(f"页面诊断文本: {body_text}")
+    if html_preview:
+        print(f"页面诊断HTML: {html_preview}")
 
 
 def extract_product_from_item(item, cate_no: str):
@@ -629,13 +635,13 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
             sleep_between_pages()
         try:
             print(f"打开页面: {current_url}")
-            page.goto(current_url, timeout=25000, wait_until="commit")
+            page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
         except Exception as e:
             print(f"页面加载异常，重试一次: {current_url} | {e}")
             try:
                 sleep_between_pages()
                 print(f"重新打开页面: {current_url}")
-                page.goto(current_url, timeout=20000, wait_until="commit")
+                page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
             except Exception as retry_error:
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
         try:
