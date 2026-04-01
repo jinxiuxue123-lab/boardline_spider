@@ -36,6 +36,7 @@ CATEGORY_SLEEP_MIN_SECONDS = 5.0
 CATEGORY_SLEEP_MAX_SECONDS = 8.0
 OPTION_REQUEST_TIMEOUT_SECONDS = 12
 IMAGE_REQUEST_TIMEOUT_SECONDS = 8
+DEBUG_DIR = Path("logs/one8_debug")
 
 
 class CategoryPageLoadError(Exception):
@@ -52,6 +53,23 @@ def sleep_between_categories() -> None:
     delay = random.uniform(CATEGORY_SLEEP_MIN_SECONDS, CATEGORY_SLEEP_MAX_SECONDS)
     print(f"分类间隔休眠: {delay:.1f}s")
     time.sleep(delay)
+
+
+def save_debug_artifacts(page, category_name: str, page_num: int, stage: str) -> None:
+    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+    safe_category = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", category_name).strip("_") or "unknown"
+    prefix = DEBUG_DIR / f"{safe_category}_page{page_num}_{stage}"
+    try:
+        html = page.content()
+        prefix.with_suffix(".html").write_text(html, encoding="utf-8")
+        print(f"已保存调试HTML: {prefix.with_suffix('.html')}")
+    except Exception as e:
+        print(f"保存调试HTML失败: {e}")
+    try:
+        page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True)
+        print(f"已保存调试截图: {prefix.with_suffix('.png')}")
+    except Exception as e:
+        print(f"保存调试截图失败: {e}")
 
 
 def upsert_one8_product_update_with_change_log(
@@ -588,16 +606,19 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
             page.goto(current_url, timeout=25000, wait_until="commit")
         except Exception as e:
             print(f"页面加载异常，重试一次: {current_url} | {e}")
+            save_debug_artifacts(page, category_name, page_num, "goto_retry")
             try:
                 sleep_between_pages()
                 print(f"重新打开页面: {current_url}")
                 page.goto(current_url, timeout=20000, wait_until="commit")
             except Exception as retry_error:
+                save_debug_artifacts(page, category_name, page_num, "goto_failed")
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
         try:
             print("等待商品列表选择器...")
             page.wait_for_selector("ul.prdList > li, .ec-base-product ul.prdList > li, li[id^='anchorBoxId_']", timeout=20000)
         except Exception as e:
+            save_debug_artifacts(page, category_name, page_num, "wait_failed")
             raise CategoryPageLoadError(f"{current_url} | 商品列表未就绪: {e}") from e
         page.wait_for_timeout(800)
 
@@ -718,20 +739,6 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headed)
         context = browser.new_context()
-
-        def route_handler(route):
-            request = route.request
-            resource_type = request.resource_type
-            url = request.url.lower()
-            if resource_type in {"image", "media", "font"}:
-                route.abort()
-                return
-            if any(token in url for token in ("google-analytics", "googletagmanager", "doubleclick", "facebook.net", "analytics")):
-                route.abort()
-                return
-            route.continue_()
-
-        context.route("**/*", route_handler)
         page = context.new_page()
         page.set_default_navigation_timeout(45000)
         page.set_default_timeout(15000)
