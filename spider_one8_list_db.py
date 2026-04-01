@@ -6,11 +6,12 @@ import random
 import re
 import sqlite3
 import time
+from html import unescape
+from html.parser import HTMLParser
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import pandas as pd
 import requests
-from playwright.sync_api import sync_playwright
 
 from db_utils import (
     get_latest_update,
@@ -34,24 +35,8 @@ PAGE_SLEEP_MIN_SECONDS = 2.0
 PAGE_SLEEP_MAX_SECONDS = 4.0
 CATEGORY_SLEEP_MIN_SECONDS = 5.0
 CATEGORY_SLEEP_MAX_SECONDS = 8.0
-OPTION_REQUEST_TIMEOUT_SECONDS = 12
-IMAGE_REQUEST_TIMEOUT_SECONDS = 8
-DEBUG_DIR = Path("logs/one8_debug")
-REALISTIC_USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
-BLOCKED_THIRD_PARTY_TOKENS = (
-    "daumcdn.net",
-    "widerplanet.com",
-    "wcs.naver.net",
-    "kakao",
-    "googletagmanager.com",
-    "google-analytics.com",
-    "doubleclick.net",
-    "facebook.net",
-)
+PAGE_REQUEST_TIMEOUT_SECONDS = 20
+PAGE_REQUEST_RETRIES = 2
 
 
 class CategoryPageLoadError(Exception):
@@ -68,77 +53,6 @@ def sleep_between_categories() -> None:
     delay = random.uniform(CATEGORY_SLEEP_MIN_SECONDS, CATEGORY_SLEEP_MAX_SECONDS)
     print(f"分类间隔休眠: {delay:.1f}s")
     time.sleep(delay)
-
-
-def save_debug_artifacts(page, category_name: str, page_num: int, stage: str) -> None:
-    DEBUG_DIR.mkdir(parents=True, exist_ok=True)
-    safe_category = re.sub(r"[^\w\u4e00-\u9fff\-]+", "_", category_name).strip("_") or "unknown"
-    prefix = DEBUG_DIR / f"{safe_category}_page{page_num}_{stage}"
-    try:
-        html = page.content()
-        prefix.with_suffix(".html").write_text(html, encoding="utf-8")
-        print(f"已保存调试HTML: {prefix.with_suffix('.html')}")
-    except Exception as e:
-        print(f"保存调试HTML失败: {e}")
-    try:
-        page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True, animations="disabled", timeout=5000)
-        print(f"已保存调试截图: {prefix.with_suffix('.png')}")
-    except Exception as e:
-        print(f"保存调试截图失败: {e}")
-
-
-def wait_for_product_markup(page, timeout_ms: int = 60000, interval_ms: int = 3000) -> bool:
-    deadline = time.time() + (timeout_ms / 1000)
-    round_no = 0
-    while time.time() < deadline:
-        round_no += 1
-        try:
-            html = page.content()
-        except Exception:
-            html = ""
-
-        if "anchorBoxId_" in html:
-            print(f"检测到商品标记: anchorBoxId_ | round={round_no}")
-            return True
-        if 'class="prdList' in html or "class='prdList" in html:
-            print(f"检测到列表标记: prdList | round={round_no}")
-            return True
-
-        try:
-            item_count = page.locator("li[id^='anchorBoxId_']").count()
-        except Exception:
-            item_count = 0
-        print(f"等待商品标记中: round={round_no} | dom_item_count={item_count}")
-        page.wait_for_timeout(interval_ms)
-
-    return False
-
-
-def auto_scroll(page) -> None:
-    try:
-        page.evaluate(
-            """
-            async () => {
-              await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 200;
-                const timer = setInterval(() => {
-                  const scrollHeight = document.body ? document.body.scrollHeight : 0;
-                  window.scrollBy(0, distance);
-                  totalHeight += distance;
-                  if (totalHeight >= scrollHeight) {
-                    clearInterval(timer);
-                    window.scrollTo(0, 0);
-                    resolve();
-                  }
-                }, 120);
-              });
-            }
-            """
-        )
-        print("已执行页面滚动触发")
-    except Exception as e:
-        print(f"页面滚动触发失败: {e}")
 
 
 def upsert_one8_product_update_with_change_log(
@@ -243,13 +157,13 @@ def download_image(image_url: str, branduid: str) -> str | None:
             "User-Agent": "Mozilla/5.0",
             "Referer": BASE_URL,
         }
-        resp = requests.get(image_url, headers=headers, timeout=IMAGE_REQUEST_TIMEOUT_SECONDS)
+        resp = requests.get(image_url, headers=headers, timeout=20)
         resp.raise_for_status()
         save_path.write_bytes(resp.content)
         print(f"下载成功: {branduid}")
         return str(save_path)
     except Exception as e:
-        print(f"下载跳过: {branduid} | {e}")
+        print(f"下载失败: {image_url} | {e}")
         return None
 
 
@@ -286,10 +200,6 @@ def clear_category_progress(category_name: str) -> None:
     progress = read_progress()
     progress.pop(category_name, None)
     write_progress(progress)
-
-
-def clean_text(text: str) -> str:
-    return " ".join((text or "").split()).strip()
 
 
 def clean_option_text(text: str) -> str:
@@ -430,7 +340,7 @@ def fetch_option_stock(product_no: str, cate_no: str) -> str:
     last_error = None
     for attempt in range(1, OPTION_REQUEST_RETRIES + 1):
         try:
-            resp = requests.get(option_url, headers=headers, timeout=OPTION_REQUEST_TIMEOUT_SECONDS)
+            resp = requests.get(option_url, headers=headers, timeout=20)
             resp.raise_for_status()
             html = resp.text
             break
@@ -549,6 +459,10 @@ def normalize_product_url(href: str) -> tuple[str | None, str | None]:
     return goods_no, clean_url
 
 
+def clean_text(text: str) -> str:
+    return " ".join((text or "").split()).strip()
+
+
 def parse_price_value(value: str) -> str:
     value = clean_text(value)
     if not value:
@@ -559,19 +473,125 @@ def parse_price_value(value: str) -> str:
     return f"{int(digits):,}원"
 
 
-def is_sold_out_item(item) -> bool:
-    description = item.query_selector("div.description")
-    raw_price = clean_text((description.get_attribute("ec-data-price") if description else "") or "")
-    if raw_price == "품절":
-        return True
+class One8ListParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.products = []
+        self._in_item = False
+        self._item_depth = 0
+        self._current = None
+        self._capture_eng_name = False
+        self._capture_name = False
+        self._capture_discount_note = False
+        self._eng_name_parts = []
+        self._name_parts = []
+        self._discount_note_parts = []
 
-    soldout_texts = []
-    soldout_wrap = item.query_selector(".soldout_wrap")
-    if soldout_wrap:
-        soldout_texts.append(clean_text(soldout_wrap.inner_text() or ""))
-    soldout_texts.append(clean_text(item.inner_text() or ""))
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+        class_attr = attrs_dict.get("class", "")
+        class_list = class_attr.split()
 
-    return any("품절" in text for text in soldout_texts if text)
+        if tag == "li" and (attrs_dict.get("id") or "").startswith("anchorBoxId_"):
+            self._in_item = True
+            self._item_depth = 1
+            self._current = {
+                "href": "",
+                "name": "",
+                "image_url": "",
+                "original_price": "",
+                "discount_price": "",
+                "discount_note": "",
+                "text_parts": [],
+            }
+            self._eng_name_parts = []
+            self._name_parts = []
+            self._discount_note_parts = []
+            self._capture_eng_name = False
+            self._capture_name = False
+            self._capture_discount_note = False
+            return
+
+        if not self._in_item or self._current is None:
+            return
+
+        if tag == "li":
+            self._item_depth += 1
+
+        if tag == "a":
+            href = (attrs_dict.get("href") or "").strip()
+            if "/product/" in href and not self._current["href"]:
+                self._current["href"] = href
+        elif tag == "img":
+            image_url = (
+                attrs_dict.get("ec-data-src")
+                or attrs_dict.get("data-src")
+                or attrs_dict.get("src")
+                or ""
+            ).strip()
+            if image_url and not self._current["image_url"]:
+                self._current["image_url"] = image_url
+        elif tag == "div" and "description" in class_list:
+            self._current["original_price"] = parse_price_value(attrs_dict.get("ec-data-custom", ""))
+            self._current["discount_price"] = parse_price_value(attrs_dict.get("ec-data-price", ""))
+        elif tag == "span" and "eng_name" in class_list:
+            self._capture_eng_name = True
+            self._eng_name_parts = []
+        elif tag == "div" and "name" in class_list:
+            self._capture_name = True
+            self._name_parts = []
+        elif tag == "div" and "custom_pro_txt" in class_list:
+            self._capture_discount_note = True
+            self._discount_note_parts = []
+
+    def handle_endtag(self, tag):
+        if not self._in_item or self._current is None:
+            return
+
+        if tag == "span" and self._capture_eng_name:
+            self._capture_eng_name = False
+            text = clean_text("".join(self._eng_name_parts))
+            if text:
+                self._current["name"] = text
+            self._eng_name_parts = []
+            return
+
+        if tag == "div" and self._capture_name:
+            self._capture_name = False
+            text = clean_text("".join(self._name_parts))
+            if text and not self._current["name"]:
+                self._current["name"] = text
+            self._name_parts = []
+            return
+
+        if tag == "div" and self._capture_discount_note:
+            self._capture_discount_note = False
+            self._current["discount_note"] = clean_text("".join(self._discount_note_parts))
+            self._discount_note_parts = []
+            return
+
+        if tag == "li":
+            self._item_depth -= 1
+            if self._item_depth == 0:
+                self._in_item = False
+                full_text = clean_text(" ".join(self._current["text_parts"]))
+                self._current["sold_out"] = "품절" in full_text
+                if self._current.get("href"):
+                    self.products.append(self._current)
+                self._current = None
+
+    def handle_data(self, data):
+        if not self._in_item or self._current is None:
+            return
+        text = clean_text(data)
+        if text:
+            self._current["text_parts"].append(text)
+        if self._capture_eng_name:
+            self._eng_name_parts.append(data)
+        if self._capture_name:
+            self._name_parts.append(data)
+        if self._capture_discount_note:
+            self._discount_note_parts.append(data)
 
 
 def make_page_url(url: str, page_num: int) -> str:
@@ -582,66 +602,32 @@ def make_page_url(url: str, page_num: int) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_query, parsed.fragment))
 
 
-def extract_product_items(page):
-    selectors = [
-        "div.right ul.prdList > li[id^='anchorBoxId_']",
-        ".ec-base-product ul.prdList > li[id^='anchorBoxId_']",
-        "ul.prdList > li[id^='anchorBoxId_']",
-    ]
-    for selector in selectors:
-        items = page.query_selector_all(selector)
-        if items:
-            return items
-    return []
+def fetch_category_html(session: requests.Session, current_url: str) -> str:
+    response = session.get(
+        current_url,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": BASE_URL},
+        timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    return response.text
+
+
+def extract_product_items_from_html(html: str):
+    parser = One8ListParser()
+    parser.feed(html or "")
+    return parser.products
 
 
 def extract_product_from_item(item, cate_no: str):
-    link = item.query_selector("div.thumbnail a[href*='/product/']") or item.query_selector("a[href*='/product/']")
-    if not link:
-        return None
-    href = (link.get_attribute("href") or "").strip()
+    href = clean_text(item.get("href") or "")
     branduid, product_url = normalize_product_url(href)
     if not branduid or not product_url:
         return None
 
-    name = ""
-    eng_name_el = item.query_selector("span.eng_name")
-    if eng_name_el:
-        name = clean_text(eng_name_el.inner_text() or "")
-    if not name:
-        name_el = item.query_selector("div.description div.name span.name") or item.query_selector("div.description div.name")
-        if name_el:
-            name = clean_text(name_el.inner_text() or "")
-    if not name:
-        name = clean_text(link.get_attribute("title") or "")
-
-    image_url = ""
-    img = item.query_selector("img.thumb_Img") or item.query_selector("img")
-    if img:
-        image_url = clean_text(
-            img.get_attribute("ec-data-src")
-            or img.get_attribute("data-src")
-            or img.get_attribute("src")
-            or ""
-        )
+    name = clean_text(item.get("name") or "")
+    image_url = clean_text(item.get("image_url") or "")
     if image_url:
         image_url = urljoin(BASE_URL, image_url)
-
-    description = item.query_selector("div.description")
-    original_price = parse_price_value(
-        (description.get_attribute("ec-data-custom") if description else "")
-        or item.get_attribute("custom")
-        or ""
-    )
-    discount_price = parse_price_value(
-        (description.get_attribute("ec-data-price") if description else "")
-        or item.get_attribute("ec-data-price")
-        or ""
-    )
-    discount_note = ""
-    discount_font = item.query_selector("div.custom_pro_txt font") or item.query_selector("div.custom_pro_txt span")
-    if discount_font:
-        discount_note = clean_text(discount_font.inner_text() or "")
 
     return {
         "branduid": branduid,
@@ -649,18 +635,20 @@ def extract_product_from_item(item, cate_no: str):
         "url": product_url,
         "name": name,
         "image_url": image_url,
-        "original_price": original_price,
-        "discount_price": discount_price,
-        "discount_note": discount_note,
+        "original_price": clean_text(item.get("original_price") or ""),
+        "discount_price": clean_text(item.get("discount_price") or ""),
+        "discount_note": clean_text(item.get("discount_note") or ""),
+        "sold_out": bool(item.get("sold_out")),
     }
 
 
-def crawl_category(page, category_url: str, category_name: str, remaining_limit=None, start_page: int = 1) -> int:
+def crawl_category(category_url: str, category_name: str, remaining_limit=None, start_page: int = 1) -> int:
     page_num = start_page
     total_count = 0
     cate_no = (parse_qs(urlparse(category_url).query).get("cate_no") or [""])[0].strip()
     stop_category = False
     consecutive_sold_out = 0
+    session = requests.Session()
 
     while True:
         if remaining_limit is not None and total_count >= remaining_limit:
@@ -672,32 +660,17 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
             sleep_between_pages()
         try:
             print(f"打开页面: {current_url}")
-            page.goto(current_url, timeout=25000, wait_until="commit")
-            auto_scroll(page)
+            html = fetch_category_html(session, current_url)
         except Exception as e:
             print(f"页面加载异常，重试一次: {current_url} | {e}")
-            save_debug_artifacts(page, category_name, page_num, "goto_retry")
             try:
                 sleep_between_pages()
                 print(f"重新打开页面: {current_url}")
-                page.goto(current_url, timeout=20000, wait_until="commit")
-                auto_scroll(page)
+                html = fetch_category_html(session, current_url)
             except Exception as retry_error:
-                save_debug_artifacts(page, category_name, page_num, "goto_failed")
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
-        try:
-            print("等待商品列表标记...")
-            ready = wait_for_product_markup(page, timeout_ms=60000, interval_ms=3000)
-            if not ready:
-                raise TimeoutError("60秒内未检测到 prdList 或 anchorBoxId_")
-        except Exception as e:
-            save_debug_artifacts(page, category_name, page_num, "wait_failed")
-            raise CategoryPageLoadError(f"{current_url} | 商品列表未就绪: {e}") from e
-        page.wait_for_timeout(800)
-
-        product_items = extract_product_items(page)
-        product_links = page.query_selector_all("ul.prdList a[href*='/product/']")
-        print(f"调试: prdList商品项={len(product_items)} | product链接={len(product_links)} | url={current_url}")
+        product_items = extract_product_items_from_html(html)
+        print(f"调试: prdList商品项={len(product_items)} | url={current_url}")
         if not product_items:
             break
 
@@ -709,7 +682,7 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
         for item in product_items:
             if remaining_limit is not None and total_count >= remaining_limit:
                 break
-            if is_sold_out_item(item):
+            if item.get("sold_out"):
                 page_skipped += 1
                 consecutive_sold_out += 1
                 if consecutive_sold_out >= 5:
@@ -720,10 +693,7 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
             consecutive_sold_out = 0
             product = extract_product_from_item(item, cate_no)
             if not product:
-                href_debug = ""
-                link_debug = item.query_selector("div.thumbnail a[href*='/product/']") or item.query_selector("a[href*='/product/']")
-                if link_debug:
-                    href_debug = (link_debug.get_attribute("href") or "").strip()
+                href_debug = clean_text(item.get("href") or "")
                 print(f"跳过商品: href={href_debug}")
                 page_skipped += 1
                 continue
@@ -809,120 +779,44 @@ def main():
             if category_name == progress_start_name:
                 start_index = idx
                 break
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=not args.headed,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
-        )
-        context = browser.new_context(
-            user_agent=REALISTIC_USER_AGENT,
-            viewport={"width": 1920, "height": 1080},
-            locale="ko-KR",
-            timezone_id="Asia/Seoul",
-        )
-        context.set_extra_http_headers(
-            {
-                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Upgrade-Insecure-Requests": "1",
-            }
-        )
-        context.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-            Object.defineProperty(navigator, 'language', { get: () => 'ko-KR' });
-            Object.defineProperty(navigator, 'languages', { get: () => ['ko-KR', 'ko', 'en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins', {
-              get: () => [
-                { name: 'Chrome PDF Plugin' },
-                { name: 'Chrome PDF Viewer' },
-                { name: 'Native Client' }
-              ]
-            });
-            window.chrome = window.chrome || { runtime: {} };
-            """
-        )
-        def route_handler(route):
-            try:
-                url = route.request.url.lower()
-                resource_type = route.request.resource_type
-                if any(token in url for token in BLOCKED_THIRD_PARTY_TOKENS):
-                    print(f"拦截第三方资源: {url}")
-                    route.abort()
-                    return
-                if resource_type in {"image", "media"}:
-                    route.abort()
-                    return
-            except Exception:
-                pass
-            route.continue_()
-
-        context.route("**/*", route_handler)
-        page = context.new_page()
-        page.set_default_navigation_timeout(45000)
-        page.set_default_timeout(15000)
-        logged_response_urls = set()
-
-        def log_response(response):
-            try:
-                url = response.url
-                lower_url = url.lower()
-                if any(token in lower_url for token in ("product/list", "exec/front", "category", ".js", ".json")):
-                    key = (response.status, url)
-                    if key not in logged_response_urls and len(logged_response_urls) < 30:
-                        logged_response_urls.add(key)
-                        print(f"响应: {response.status} | {url}")
-            except Exception:
-                return
-
-        page.on("response", log_response)
-
-        for idx, row in categories_df.iterrows():
-            if idx < start_index:
-                continue
-            if TEST_LIMIT is not None and total_processed >= TEST_LIMIT:
-                break
-            category_name = clean_text(str(row.get("name") or ""))
-            category_url = clean_text(str(row.get("url") or ""))
-            if not category_name or not category_url:
-                continue
-            print(f"\n开始分类: {category_name} | 当前累计: {total_processed}")
-            category_progress = progress.get(category_name, {})
-            start_page = int(category_progress.get("next_page", 1) or 1)
-            remaining_limit = None
-            if TEST_LIMIT is not None:
-                remaining_limit = TEST_LIMIT - total_processed
-            try:
-                category_total = crawl_category(
-                    page,
-                    category_url,
-                    category_name,
-                    remaining_limit=remaining_limit,
-                    start_page=start_page,
-                )
-            except CategoryPageLoadError as e:
-                print(f"分类页面连续失败，已保留断点，停止本轮抓取: {category_name} | {e}")
-                completed_all = False
-                break
-            except Exception:
-                raise
-            total_processed += category_total
-            print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
-            clear_category_progress(category_name)
-            if idx + 1 < len(categories_df):
-                sleep_between_categories()
-            if idx + 1 < len(categories_df):
-                next_row = categories_df.iloc[idx + 1]
-                next_name = clean_text(str(next_row.get("name") or ""))
-                if next_name:
-                    update_category_progress(next_name, 1)
-
-        context.close()
-        browser.close()
+    for idx, row in categories_df.iterrows():
+        if idx < start_index:
+            continue
+        if TEST_LIMIT is not None and total_processed >= TEST_LIMIT:
+            break
+        category_name = clean_text(str(row.get("name") or ""))
+        category_url = clean_text(str(row.get("url") or ""))
+        if not category_name or not category_url:
+            continue
+        print(f"\n开始分类: {category_name} | 当前累计: {total_processed}")
+        category_progress = progress.get(category_name, {})
+        start_page = int(category_progress.get("next_page", 1) or 1)
+        remaining_limit = None
+        if TEST_LIMIT is not None:
+            remaining_limit = TEST_LIMIT - total_processed
+        try:
+            category_total = crawl_category(
+                category_url,
+                category_name,
+                remaining_limit=remaining_limit,
+                start_page=start_page,
+            )
+        except CategoryPageLoadError as e:
+            print(f"分类页面连续失败，已保留断点，停止本轮抓取: {category_name} | {e}")
+            completed_all = False
+            break
+        except Exception:
+            raise
+        total_processed += category_total
+        print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
+        clear_category_progress(category_name)
+        if idx + 1 < len(categories_df):
+            sleep_between_categories()
+        if idx + 1 < len(categories_df):
+            next_row = categories_df.iloc[idx + 1]
+            next_name = clean_text(str(next_row.get("name") or ""))
+            if next_name:
+                update_category_progress(next_name, 1)
 
     if completed_all:
         clear_progress()
