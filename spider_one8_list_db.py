@@ -42,6 +42,16 @@ REALISTIC_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/122.0.0.0 Safari/537.36"
 )
+BLOCKED_THIRD_PARTY_TOKENS = (
+    "daumcdn.net",
+    "widerplanet.com",
+    "wcs.naver.net",
+    "kakao",
+    "googletagmanager.com",
+    "google-analytics.com",
+    "doubleclick.net",
+    "facebook.net",
+)
 
 
 class CategoryPageLoadError(Exception):
@@ -71,7 +81,7 @@ def save_debug_artifacts(page, category_name: str, page_num: int, stage: str) ->
     except Exception as e:
         print(f"保存调试HTML失败: {e}")
     try:
-        page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True)
+        page.screenshot(path=str(prefix.with_suffix(".png")), full_page=True, animations="disabled", timeout=5000)
         print(f"已保存调试截图: {prefix.with_suffix('.png')}")
     except Exception as e:
         print(f"保存调试截图失败: {e}")
@@ -836,6 +846,22 @@ def main():
             window.chrome = window.chrome || { runtime: {} };
             """
         )
+        def route_handler(route):
+            try:
+                url = route.request.url.lower()
+                resource_type = route.request.resource_type
+                if any(token in url for token in BLOCKED_THIRD_PARTY_TOKENS):
+                    print(f"拦截第三方资源: {url}")
+                    route.abort()
+                    return
+                if resource_type in {"image", "media"}:
+                    route.abort()
+                    return
+            except Exception:
+                pass
+            route.continue_()
+
+        context.route("**/*", route_handler)
         page = context.new_page()
         page.set_default_navigation_timeout(45000)
         page.set_default_timeout(15000)
