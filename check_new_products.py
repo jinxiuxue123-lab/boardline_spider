@@ -25,6 +25,13 @@ def extract_branduid(url: str) -> str | None:
     return None
 
 
+def decode_boardline_html(response) -> str:
+    try:
+        return response.content.decode("euc-kr")
+    except UnicodeDecodeError:
+        return response.content.decode("euc-kr", errors="ignore")
+
+
 def fetch_category_html(category_name: str, category_url: str) -> str:
     last_error = None
     for attempt in range(1, PAGE_REQUEST_RETRIES + 1):
@@ -35,7 +42,7 @@ def fetch_category_html(category_name: str, category_url: str) -> str:
                 timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
             )
             response.raise_for_status()
-            return response.text
+            return decode_boardline_html(response)
         except Exception as exc:
             last_error = exc
             print(f"分类首屏请求失败，重试 {attempt}/{PAGE_REQUEST_RETRIES}: {category_name} | {exc}")

@@ -103,6 +103,13 @@ def clean_name(text):
     return " ".join(text.split())
 
 
+def decode_boardline_html(response):
+    try:
+        return response.content.decode("euc-kr")
+    except UnicodeDecodeError:
+        return response.content.decode("euc-kr", errors="ignore")
+
+
 def make_page_url(url, page_num):
     parsed = urlparse(url)
     query = parse_qs(parsed.query)
@@ -258,10 +265,11 @@ def open_page_with_retries(session, category_name, current_url, page_num):
                 timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
                 allow_redirects=False,
             )
-            if is_rate_limited(response, response.text):
+            html_text = decode_boardline_html(response)
+            if is_rate_limited(response, html_text):
                 raise RuntimeError("目标站点触发限流/封禁提示页")
             response.raise_for_status()
-            return response.text
+            return html_text
         except Exception as e:
             last_error = str(e)
             print(f"页面失败（第 {attempt} 次）: {e}")
