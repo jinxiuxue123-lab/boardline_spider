@@ -118,6 +118,8 @@ class BoardlineListParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.products = []
+        self._content_wrap_depth = 0
+        self._target_list_depth = 0
         self._in_td = False
         self._td_depth = 0
         self._current = None
@@ -127,6 +129,24 @@ class BoardlineListParser(HTMLParser):
     def handle_starttag(self, tag, attrs):
         attrs_dict = dict(attrs)
         classes = attrs_dict.get("class", "")
+        class_list = classes.split()
+
+        if tag == "div":
+            element_id = attrs_dict.get("id", "")
+            if element_id == "contentWrap":
+                self._content_wrap_depth = 1
+            elif self._content_wrap_depth > 0:
+                self._content_wrap_depth += 1
+
+            if self._content_wrap_depth > 0 and "prd-list" in class_list and self._target_list_depth == 0:
+                self._target_list_depth = 1
+            elif self._target_list_depth > 0:
+                self._target_list_depth += 1
+            return
+
+        if self._target_list_depth == 0:
+            return
+
         if tag == "td":
             self._in_td = True
             self._td_depth += 1
@@ -141,16 +161,26 @@ class BoardlineListParser(HTMLParser):
 
         if tag == "a":
             href = attrs_dict.get("href", "")
-            if "branduid=" in href and not self._current["href"]:
+            if "shopdetail.html" in href and "branduid=" in href and not self._current["href"]:
                 self._current["href"] = href
         elif tag == "img":
             src = attrs_dict.get("src", "")
             if src and not self._current["image_url"]:
                 self._current["image_url"] = src
-        elif tag == "li" and "dsc" in classes.split():
+        elif tag == "li" and "dsc" in class_list:
             self._capture_name = True
 
     def handle_endtag(self, tag):
+        if tag == "div":
+            if self._target_list_depth > 0:
+                self._target_list_depth -= 1
+            if self._content_wrap_depth > 0:
+                self._content_wrap_depth -= 1
+            return
+
+        if self._target_list_depth == 0:
+            return
+
         if tag == "li" and self._capture_name:
             self._capture_name = False
             if self._current is not None:
@@ -167,7 +197,7 @@ class BoardlineListParser(HTMLParser):
                 self._current = None
 
     def handle_data(self, data):
-        if self._capture_name:
+        if self._target_list_depth > 0 and self._capture_name:
             self._name_parts.append(data)
 
 
