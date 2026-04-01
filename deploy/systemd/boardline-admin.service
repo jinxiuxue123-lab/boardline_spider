@@ -1,0 +1,15 @@
+[Unit]
+Description=Boardline Admin Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/boardline_spider
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/bin/zsh /root/boardline_spider/scripts/run_admin_server.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

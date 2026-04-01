@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Boardline Daily Sync Every Day
+
+[Timer]
+OnCalendar=*-*-* 02:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

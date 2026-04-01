@@ -1,0 +1,405 @@
+可以。下面我给你一份 **正式运行说明书**，你照着执行就行。
+
+---
+
+# 一、每天的执行命令和流程
+
+## 第一次初始化时
+
+按这个顺序执行：
+
+```bash
+python3 init_db.py
+python3 spider_list_db.py
+python3 update_stock_db_concurrent.py
+python3 export_all_stock.py
+```
+
+### 作用
+
+1. `init_db.py`
+   初始化数据库
+
+2. `spider_list_db.py`
+   抓全站商品列表，写入商品主表
+
+3. `update_stock_db_concurrent.py`
+   抓所有 active 商品详情页，更新价格和库存
+
+4. `export_all_stock.py`
+   导出当前全量库存表格
+
+---
+
+## 正式日常运行时
+
+以后你每天主要执行这一个命令：
+
+```bash
+python3 daily_sync.py
+```
+
+### `daily_sync.py` 每天内部会自动做
+
+1. 检查首页分类前 20 个商品，观察是否有新增
+2. 同步全站商品列表到数据库
+3. 更新 `missing_days` 和 `status`
+4. 并发更新 active 商品库存和价格
+5. 导出当天变化表
+
+---
+
+## 每天跑完后，你可以按需再执行
+
+### 导出当天变化商品
+
+```bash
+python3 export_changes.py
+```
+
+### 导出当前全量库存表
+
+```bash
+python3 export_all_stock.py
+```
+
+---
+
+# 二、建议你的正式日常流程
+
+## 每天早上
+
+```bash
+python3 daily_sync.py
+python3 export_all_stock.py
+```
+
+## 每天晚上
+
+```bash
+python3 daily_sync.py
+python3 export_changes.py
+```
+
+---
+
+# 三、如果中途失败怎么办
+
+## 并发库存更新脚本有断点
+
+如果 `update_stock_db_concurrent.py` 中途停了，再执行一次：
+
+```bash
+python3 update_stock_db_concurrent.py
+```
+
+它会从上次进度继续。
+
+---
+
+## 如果有失败商品
+
+查看失败文件：
+
+```bash
+cat failed_stock_urls.txt
+```
+
+如果需要单独补抓，可以运行你之前做的失败重试脚本。
+
+---
+
+# 四、现在这些代码文件的作用
+
+下面我按你现在主要会用到的文件给你做一份说明。
+
+---
+
+## 1. `init_db.py`
+
+**作用：初始化数据库**
+**English:** Initialize database
+**中文备注：** 创建 `products.db` 和里面的表结构。通常只在第一次建系统时运行一次。
+
+---
+
+## 2. `db_utils.py`
+
+**作用：数据库操作工具函数**
+**English:** Database utility functions
+**中文备注：** 所有脚本通过它读写数据库，比如插入商品、更新库存、记录变化日志、更新下架状态。
+
+---
+
+## 3. `spider_categories.py`
+
+**作用：抓取网站分类**
+**English:** Crawl category list
+**中文备注：** 从网站菜单抓分类链接，生成 `categories.xlsx`。通常初始化或分类变化时运行。
+
+---
+
+## 4. `spider_list_db.py`
+
+**作用：抓取商品列表并写入数据库**
+**English:** Crawl product list and save into database
+**中文备注：** 进入各分类页，翻页抓取所有商品，把商品主信息写入 `products` 表。也会更新 `last_seen`。
+
+---
+
+## 5. `check_new_products.py`
+
+**作用：快速巡检新增商品**
+**English:** Quick check for new products
+**中文备注：** 只检查每个分类第一页前 20 个商品，判断有没有新商品。主要用于日更前的快速观察。
+
+---
+
+## 6. `update_stock_db.py`
+
+**作用：单线程更新库存和价格**
+**English:** Update stock and price in single-thread mode
+**中文备注：** 逐个进入商品详情页，更新库存和价格。你现在主要已经不用它了，保留作备用。
+
+---
+
+## 7. `update_stock_db_concurrent.py`
+
+**作用：并发更新库存和价格**
+**English:** Concurrent stock and price updater
+**中文备注：** 现在的主力库存更新脚本。并发打开多个详情页，提高速度，把最新库存和价格写入 `product_updates`，变化写入 `change_logs`。
+
+---
+
+## 8. `daily_sync.py`
+
+**作用：每日同步主入口**
+**English:** Daily sync main entry
+**中文备注：** 这是你以后每天运行的核心脚本。内部会自动调用列表同步、上下架判断、库存更新、变化导出。
+
+---
+
+## 9. `export_changes.py`
+
+**作用：导出当天变化商品表**
+**English:** Export today’s changes
+**中文备注：** 从 `change_logs` 导出今天发生变化的商品，比如库存变化、价格变化。
+
+---
+
+## 10. `export_all_stock.py`
+
+**作用：导出当前全量库存表**
+**English:** Export all current stock
+**中文备注：** 从数据库导出当前所有商品的最新库存、价格、链接、图片链接。
+
+---
+
+## 11. `test_stock_parser.py`
+
+**作用：测试单个商品库存解析**
+**English:** Test parser for one product stock
+**中文备注：** 调试用。用于检查某个商品为什么会出现 `DEFAULT:1`，或者库存结构是否特殊。
+
+---
+
+# 五、数据库文件说明
+
+## `products.db`
+
+**作用：主数据库文件**
+**English:** Main SQLite database
+**中文备注：** 保存你的商品主信息、库存、变化日志、任务记录。
+
+---
+
+# 六、数据库表结构说明
+
+下面是你现在数据库里最重要的表。
+
+---
+
+## 1. `products`
+
+**作用：商品主表**
+**English:** Product master table
+**中文备注：** 存商品的基础信息和状态
+
+| Field          | 中文      | 说明                          |
+| -------------- | ------- | --------------------------- |
+| `id`           | 主键ID    | 数据库内部自增ID                   |
+| `source`       | 来源网站    | 例如 `boardline`              |
+| `branduid`     | 商品唯一ID  | 网站商品唯一编号                    |
+| `category`     | 商品分类    | 例如 `滑雪板`                    |
+| `name`         | 商品名称    | 已清理韩文后的商品名                  |
+| `url`          | 商品详情页链接 | 商品详情页地址                     |
+| `image_url`    | 商品主图链接  | 商品主图原始链接                    |
+| `status`       | 商品状态    | `active` 在售 / `inactive` 下架 |
+| `first_seen`   | 首次发现日期  | 第一次进入数据库的日期                 |
+| `last_seen`    | 最近发现日期  | 最近一次在列表页看到的日期               |
+| `missing_days` | 连续未出现天数 | 用于判断是否下架                    |
+| `created_at`   | 创建时间    | 数据创建时间                      |
+| `updated_at`   | 更新时间    | 数据更新时间                      |
+
+---
+
+## 2. `product_updates`
+
+**作用：商品最新动态表**
+**English:** Latest product update table
+**中文备注：** 存每个商品当前最新的库存和价格
+
+| Field            | 中文   | 说明               |        |
+| ---------------- | ---- | ---------------- | ------ |
+| `id`             | 主键ID | 数据库内部ID          |        |
+| `product_id`     | 商品ID | 对应 `products.id` |        |
+| `price`          | 当前售价 | 当前销售价格           |        |
+| `original_price` | 当前原价 | 原价/划线价           |        |
+| `stock`          | 当前库存 | 库存字符串，例如 `156:3  | 158:5` |
+| `updated_at`     | 更新时间 | 最近一次更新库存和价格的时间   |        |
+
+---
+
+## 3. `change_logs`
+
+**作用：商品变化日志表**
+**English:** Change log table
+**中文备注：** 记录库存、价格变化历史
+
+| Field         | 中文   | 说明                                   |
+| ------------- | ---- | ------------------------------------ |
+| `id`          | 主键ID | 数据库内部ID                              |
+| `product_id`  | 商品ID | 对应 `products.id`                     |
+| `field_name`  | 变化字段 | `price` / `original_price` / `stock` |
+| `old_value`   | 旧值   | 变化前的值                                |
+| `new_value`   | 新值   | 变化后的值                                |
+| `change_time` | 变化时间 | 本次变化记录时间                             |
+
+---
+
+## 4. `crawl_runs`
+
+**作用：抓取任务日志表**
+**English:** Crawl run log table
+**中文备注：** 记录每次抓取任务的执行情况
+
+| Field           | 中文   | 说明                     |
+| --------------- | ---- | ---------------------- |
+| `id`            | 主键ID | 数据库内部ID                |
+| `run_type`      | 任务类型 | 全量抓取 / 日更同步            |
+| `source`        | 来源网站 | 例如 `boardline`         |
+| `start_time`    | 开始时间 | 任务开始时间                 |
+| `end_time`      | 结束时间 | 任务结束时间                 |
+| `total_count`   | 总数量  | 本次处理总数                 |
+| `success_count` | 成功数量 | 本次成功数量                 |
+| `failed_count`  | 失败数量 | 本次失败数量                 |
+| `status`        | 任务状态 | `running` / `finished` |
+| `note`          | 备注   | 其他说明                   |
+
+---
+
+# 七、你现在系统里最重要的几个文件输出
+
+## `failed_stock_urls.txt`
+
+**作用：库存更新失败商品列表**
+**English:** Failed stock update URLs
+**中文备注：** 记录库存更新时失败的商品详情页链接
+
+---
+
+## `stock_db_progress_concurrent.txt`
+
+**作用：并发库存更新进度文件**
+**English:** Concurrent stock update progress
+**中文备注：** 记录并发库存更新跑到了第几个商品，用于断点续抓
+
+---
+
+## `categories.xlsx`
+
+**作用：分类表**
+**English:** Categories file
+**中文备注：** 网站分类列表
+
+---
+
+## `all_products_stock.xlsx`
+
+**作用：当前全量库存导出表**
+**English:** Export of all current stock
+**中文备注：** 你每天查看全站库存的总表
+
+---
+
+## `stock_changes_YYYY-MM-DD.xlsx`
+
+**作用：当天变化商品导出表**
+**English:** Daily changed products export
+**中文备注：** 只看当天有库存/价格变化的商品
+
+---
+
+# 八、正式运行时你最常用的命令
+
+## 每天主命令
+
+```bash
+python3 daily_sync.py
+```
+
+## 导出全量库存
+
+```bash
+python3 export_all_stock.py
+```
+
+## 导出当天变化
+
+```bash
+python3 export_changes.py
+```
+
+## 单独更新库存
+
+```bash
+python3 update_stock_db_concurrent.py
+```
+
+---
+
+# 九、你现在可以怎么理解整个系统
+
+你现在这套系统已经是：
+
+**商品目录系统 + 库存同步系统 + 变化监控系统**
+
+流程是：
+
+```text
+网站分类
+→ 商品列表
+→ 数据库 products
+→ 详情页库存更新
+→ 数据库 product_updates
+→ 变化记录 change_logs
+→ 导出变化表 / 全量库存表
+```
+
+---
+
+# 十、我建议你接下来做的事
+
+先按“每天主命令”正式跑几天，观察：
+
+* 有没有失败商品
+* 下架判断是否正常
+* 变化导出是否符合预期
+
+等这一步稳定后，再开始做下一阶段：
+
+**导出适合闲鱼/淘宝的商品模板**
+
+如果你愿意，我下一步可以继续给你一份：
+
+**“闲鱼/淘宝商品导出字段设计”**。

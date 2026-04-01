@@ -1,0 +1,79 @@
+每日执行清单
+
+一、每天正常更新
+
+按顺序执行：
+
+python3 daily_sync.py
+python3 refresh_discount_pricing.py
+python3 export_all_stock.py
+python3 generate_catalog_site.py
+
+或者直接执行：
+
+./run_daily.sh
+
+说明：
+
+1. daily_sync.py
+更新商品列表、库存、价格、变化记录、当天新增商品
+
+2. refresh_discount_pricing.py
+按当前折扣规则刷新折扣价，并联动更新人民币价格
+
+3. export_all_stock.py
+导出全量库存表
+
+4. generate_catalog_site.py
+刷新网页展示数据
+
+
+二、如果只修改了价格规则
+
+执行：
+
+python3 refresh_discount_pricing.py
+python3 export_all_stock.py
+python3 generate_catalog_site.py
+
+
+三、如果只修改了运费 / 汇率 / 利润规则
+
+执行：
+
+python3 refresh_cny_pricing.py
+python3 export_all_stock.py
+python3 generate_catalog_site.py
+
+
+四、如果导出表里有空白价格 / 空白库存 / 缺图片
+
+执行：
+
+python3 repair_missing_products.py
+python3 export_all_stock.py
+python3 generate_catalog_site.py
+
+
+五、常看文件
+
+全量库存表：
+all_products_stock.xlsx
+
+当天变化商品：
+stock_changes_年月日.xlsx
+
+当天新增商品：
+new_products_年月日.xlsx
+
+网页文件：
+web/index.html
+
+
+六、规则文件
+
+折扣规则：
+discount_rules.xlsx
+
+运费 / 汇率 / 利润规则：
+pricing_rules.xlsx

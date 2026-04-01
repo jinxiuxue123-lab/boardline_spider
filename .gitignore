@@ -1,0 +1,34 @@
+scripts/admin_env.sh
+scripts/callback_env.sh
+
+# macOS / editor
+.DS_Store
+.~*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+
+# virtual env
+.venv/
+venv/
+
+# runtime data
+data/
+logs/
+products.db
+products.db.bak_*
+stock_db_progress_concurrent.txt
+one8_list_progress.json
+failed_list_pages.txt
+
+# local temp / probe files
+tmp_*.json
+boardline_spider_deploy.tar.gz
+
+# local secrets
+scripts/*env.sh

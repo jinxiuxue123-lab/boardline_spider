@@ -1,0 +1,9 @@
+[Unit]
+Description=Boardline One8 Daily Sync
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/boardline_spider
+ExecStart=/bin/zsh /root/boardline_spider/run_one8_daily.sh

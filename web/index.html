@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Boardline 商品目录</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Boardline Catalog</p>
+          <h1>滑雪商品展示页</h1>
+          <p class="hero-text">
+            按分类浏览已抓取商品，查看商品图、名称、价格和库存。
+          </p>
+        </div>
+        <div class="hero-stats">
+          <div class="stat-card">
+            <span class="stat-label">分类数</span>
+            <strong id="categoryCount">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-label">商品数</span>
+            <strong id="productCount">0</strong>
+          </div>
+        </div>
+      </header>
+
+      <section class="toolbar">
+        <div id="categoryFilters" class="filters"></div>
+      </section>
+
+      <section class="content">
+        <div class="section-head">
+          <div>
+            <p class="section-kicker">当前分类</p>
+            <h2 id="sectionTitle">全部</h2>
+          </div>
+          <p id="sectionSummary" class="section-summary">0 个商品</p>
+        </div>
+        <div id="productGrid" class="product-grid"></div>
+        <div id="pagination" class="pagination"></div>
+      </section>
+    </div>
+
+    <script src="./catalog-data.js"></script>
+    <script src="./app.js"></script>
+  </body>
+</html>

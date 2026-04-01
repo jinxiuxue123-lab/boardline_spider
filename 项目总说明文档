@@ -1,0 +1,619 @@
+下面是一份**正式版《项目总说明文档》模板**。
+结构按真实软件项目文档写的，你可以直接保存为：
+
+```text
+README.md
+或
+项目说明文档.md
+```
+
+如果以后要给别人看、部署到服务器、或者开源，这份文档都可以直接用。
+
+---
+
+# 韩国滑雪装备库存同步系统
+
+**Korean Snow Gear Inventory Sync System**
+
+---
+
+# 1. 项目简介
+
+本项目是一套用于抓取韩国滑雪装备网站商品数据并同步库存的自动化系统。
+
+当前主要抓取网站：
+
+```text
+http://www.boardline.co.kr
+```
+
+系统可以自动完成：
+
+* 商品分类抓取
+* 商品列表抓取
+* 商品详情页解析
+* 商品库存获取
+* 商品价格获取
+* 商品库存变化记录
+* 商品自动下架判断
+* 商品图片下载
+* 库存表导出
+* 每日自动库存同步
+
+系统未来目标：
+
+```text
+抓取 4-6 个韩国滑雪装备网站
+并同步库存到闲鱼 / 淘宝
+```
+
+---
+
+# 2. 项目架构
+
+系统架构如下：
+
+```text
+网站分类
+   ↓
+商品列表抓取
+   ↓
+商品主表 products
+   ↓
+商品详情抓取
+   ↓
+库存表 product_updates
+   ↓
+变化日志 change_logs
+   ↓
+库存导出 / 变化导出
+```
+
+整体流程：
+
+```text
+分类 → 商品列表 → 商品详情 → 数据库存储 → 日常同步 → 导出数据
+```
+
+---
+
+# 3. 项目目录结构
+
+```text
+boardline_spider/
+
+├── products.db
+│
+├── init_db.py
+├── db_utils.py
+│
+├── spider_categories.py
+├── spider_list_db.py
+│
+├── update_stock_db.py
+├── update_stock_db_concurrent.py
+│
+├── download_product_images.py
+│
+├── check_new_products.py
+├── daily_sync.py
+│
+├── export_all_stock.py
+├── export_changes.py
+│
+├── test_stock_parser.py
+│
+├── categories.xlsx
+│
+├── images/
+│
+├── failed_stock_urls.txt
+├── stock_db_progress_concurrent.txt
+```
+
+---
+
+# 4. 系统运行环境
+
+推荐环境：
+
+```text
+Python 3.10+
+macOS / Linux / Windows
+```
+
+安装依赖：
+
+```bash
+pip install playwright
+pip install pandas
+pip install requests
+pip install openpyxl
+pip install pillow
+```
+
+安装浏览器驱动：
+
+```bash
+playwright install
+```
+
+---
+
+# 5. 数据库设计
+
+数据库：
+
+```text
+products.db
+```
+
+数据库类型：
+
+```text
+SQLite
+```
+
+---
+
+# 5.1 商品主表（products）
+
+作用：
+
+```text
+存储商品基本信息
+```
+
+字段说明：
+
+| 字段               | 中文     | 说明                |
+| ---------------- | ------ | ----------------- |
+| id               | 主键ID   | 数据库内部ID           |
+| source           | 来源网站   | boardline         |
+| branduid         | 商品ID   | 网站商品唯一ID          |
+| category         | 商品分类   | 例如：滑雪板            |
+| name             | 商品名称   | 商品标题              |
+| url              | 商品详情页  | 商品页面              |
+| image_url        | 图片URL  | 商品图片链接            |
+| local_image_path | 本地图片   | 下载后的图片            |
+| image_downloaded | 是否下载图片 | 0 / 1             |
+| status           | 商品状态   | active / inactive |
+| first_seen       | 首次发现   | 第一次抓取日期           |
+| last_seen        | 最近发现   | 最近一次出现在列表页        |
+| missing_days     | 未出现天数  | 判断下架              |
+| created_at       | 创建时间   |                   |
+| updated_at       | 更新时间   |                   |
+
+---
+
+# 5.2 库存表（product_updates）
+
+作用：
+
+```text
+存储商品当前库存
+```
+
+字段：
+
+| 字段             | 中文   | 说明 |
+| -------------- | ---- | -- |
+| id             | 主键ID |    |
+| product_id     | 商品ID |    |
+| price          | 当前价格 |    |
+| original_price | 原价   |    |
+| stock          | 库存   |    |
+| updated_at     | 更新时间 |    |
+
+库存格式示例：
+
+```text
+156:3 | 158:5
+```
+
+或
+
+```text
+BLACK(SMALL:6,MEDIUM:3)
+```
+
+---
+
+# 5.3 变化日志表（change_logs）
+
+作用：
+
+```text
+记录库存 / 价格变化
+```
+
+字段：
+
+| 字段          | 中文   | 说明 |
+| ----------- | ---- | -- |
+| id          | 主键   |    |
+| product_id  | 商品ID |    |
+| field_name  | 变化字段 |    |
+| old_value   | 旧值   |    |
+| new_value   | 新值   |    |
+| change_time | 变化时间 |    |
+
+---
+
+# 6. 库存解析逻辑
+
+网站库存结构分为三类：
+
+---
+
+## 6.1 单层库存
+
+HTML结构：
+
+```html
+<select id="MK_p_s_0">
+```
+
+解析结果：
+
+```text
+156:3 | 158:5
+```
+
+---
+
+## 6.2 双层联动库存
+
+HTML结构：
+
+```html
+MK_p_s_0 颜色
+MK_p_s_1 尺码
+```
+
+解析结果：
+
+```text
+BLACK(SMALL:6,MEDIUM:3)
+```
+
+---
+
+## 6.3 无规格商品
+
+没有 select
+
+库存返回：
+
+```text
+DEFAULT:1
+```
+
+---
+
+# 7. 滑雪板库存规则
+
+数据库分类：
+
+```text
+滑雪板
+```
+
+滑雪板库存解析规则：
+
+```text
+只解析 MK_p_s_0
+```
+
+原因：
+
+滑雪板只有尺寸：
+
+```text
+151
+154
+156
+158
+```
+
+库存示例：
+
+```text
+156:3 | 158:5
+```
+
+---
+
+# 8. 图片下载逻辑
+
+系统只在**首次抓取时下载图片**。
+
+图片字段：
+
+```text
+image_url
+local_image_path
+```
+
+下载脚本：
+
+```text
+download_product_images.py
+```
+
+图片保存目录：
+
+```text
+images/
+```
+
+特点：
+
+```text
+图片只下载一次
+日常库存更新不重复下载
+```
+
+---
+
+# 9. 并发库存更新
+
+库存更新脚本：
+
+```text
+update_stock_db_concurrent.py
+```
+
+并发参数：
+
+```python
+CONCURRENCY = 3
+BATCH_SIZE = 30
+```
+
+速度：
+
+```text
+2088商品 ≈ 30分钟
+```
+
+---
+
+# 10. 商品下架判断
+
+逻辑：
+
+```text
+今天出现 → missing_days = 0
+今天没出现 → missing_days +1
+连续3天没出现 → status = inactive
+```
+
+实现脚本：
+
+```text
+daily_sync.py
+```
+
+---
+
+# 11. 每日同步流程
+
+每天执行：
+
+```bash
+python3 daily_sync.py
+```
+
+执行流程：
+
+```text
+check_new_products.py
+↓
+spider_list_db.py
+↓
+更新 missing_days
+↓
+update_stock_db_concurrent.py
+↓
+export_changes.py
+```
+
+---
+
+# 12. 数据导出
+
+---
+
+## 12.1 导出全部库存
+
+脚本：
+
+```text
+export_all_stock.py
+```
+
+生成：
+
+```text
+all_products_stock.xlsx
+```
+
+字段：
+
+```text
+branduid
+category
+name
+url
+image_url
+local_image_path
+price
+stock
+```
+
+---
+
+## 12.2 导出库存变化
+
+脚本：
+
+```text
+export_changes.py
+```
+
+生成：
+
+```text
+stock_changes_YYYY-MM-DD.xlsx
+```
+
+内容：
+
+```text
+库存变化
+价格变化
+```
+
+---
+
+# 13. 系统初始化
+
+第一次运行：
+
+```bash
+python3 init_db.py
+python3 spider_list_db.py
+python3 update_stock_db_concurrent.py
+python3 download_product_images.py
+python3 export_all_stock.py
+```
+
+---
+
+# 14. 日常运行
+
+每天运行：
+
+```bash
+python3 daily_sync.py
+```
+
+需要库存表：
+
+```bash
+python3 export_all_stock.py
+```
+
+---
+
+# 15. 异常处理
+
+失败商品记录：
+
+```text
+failed_stock_urls.txt
+```
+
+断点续抓：
+
+```text
+stock_db_progress_concurrent.txt
+```
+
+---
+
+# 16. 当前抓取规模
+
+当前网站商品：
+
+```text
+≈ 2088
+```
+
+库存更新耗时：
+
+```text
+≈ 30分钟
+```
+
+---
+
+# 17. 系统优势
+
+本系统具有以下特点：
+
+* 自动抓取商品
+* 自动更新库存
+* 自动记录变化
+* 自动判断下架
+* 支持并发抓取
+* 支持断点续抓
+* 支持图片下载
+* 支持数据导出
+
+---
+
+# 18. 未来升级方向
+
+未来系统计划升级为：
+
+### 多网站库存系统
+
+```text
+boardline
+site2
+site3
+site4
+```
+
+### 自动同步电商平台
+
+```text
+闲鱼
+淘宝
+```
+
+流程：
+
+```text
+韩国库存
+↓
+数据库
+↓
+电商平台库存同步
+```
+
+---
+
+# 19. 当前系统状态
+
+当前系统已经实现：
+
+```text
+商品抓取
+库存同步
+库存变化记录
+商品下架判断
+图片下载
+库存导出
+变化导出
+并发更新
+```
+
+系统已经达到：
+
+```text
+长期运行状态
+```
+
+---
+
+如果你愿意，我可以再帮你生成一个 **完整的项目部署版文档（DevOps版）**，包括：
+
+* 自动每天运行
+* 自动数据库备份
+* 自动库存报告
+* 自动服务器部署
+
+那会是一个 **真正生产级的库存系统文档**。
