@@ -1,6 +1,8 @@
 import pandas as pd
 import re
 import requests
+import random
+import time
 from datetime import datetime
 from html import unescape
 from html.parser import HTMLParser
@@ -21,10 +23,13 @@ TEST_LIMIT = None
 FAILED_PAGES_FILE = "failed_list_pages.txt"
 MAX_PAGE_RETRIES = 3
 PAGE_REQUEST_TIMEOUT_SECONDS = 15
+PAGE_SLEEP_MIN_SECONDS = float(os.getenv("BOARDLINE_PAGE_SLEEP_MIN", "2.5"))
+PAGE_SLEEP_MAX_SECONDS = float(os.getenv("BOARDLINE_PAGE_SLEEP_MAX", "5.0"))
+CATEGORY_SLEEP_MIN_SECONDS = float(os.getenv("BOARDLINE_CATEGORY_SLEEP_MIN", "6"))
+CATEGORY_SLEEP_MAX_SECONDS = float(os.getenv("BOARDLINE_CATEGORY_SLEEP_MAX", "10"))
 PAGE_REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0",
     "Referer": BASE_URL,
-    "Connection": "close",
 }
 
 
@@ -222,22 +227,46 @@ def load_failed_pages():
     return items
 
 
-def open_page_with_retries(category_name, current_url, page_num):
+def is_rate_limited(response, body_text):
+    if response.status_code == 302:
+        return True
+    body_text = body_text or ""
+    return "47.80.63.228" in body_text and "페이지를 너무 많이 요청" in body_text
+
+
+def sleep_between_pages():
+    delay = random.uniform(PAGE_SLEEP_MIN_SECONDS, PAGE_SLEEP_MAX_SECONDS)
+    print(f"页面间隔休眠: {delay:.1f}s")
+    time.sleep(delay)
+
+
+def sleep_between_categories():
+    delay = random.uniform(CATEGORY_SLEEP_MIN_SECONDS, CATEGORY_SLEEP_MAX_SECONDS)
+    print(f"分类间隔休眠: {delay:.1f}s")
+    time.sleep(delay)
+
+
+def open_page_with_retries(session, category_name, current_url, page_num):
     last_error = None
 
     for attempt in range(1, MAX_PAGE_RETRIES + 1):
         try:
             print(f"打开页面尝试 {attempt}/{MAX_PAGE_RETRIES}: {current_url}")
-            response = requests.get(
+            response = session.get(
                 current_url,
                 headers=PAGE_REQUEST_HEADERS,
                 timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
+                allow_redirects=False,
             )
+            if is_rate_limited(response, response.text):
+                raise RuntimeError("目标站点触发限流/封禁提示页")
             response.raise_for_status()
             return response.text
         except Exception as e:
             last_error = str(e)
             print(f"页面失败（第 {attempt} 次）: {e}")
+            if "限流/封禁" in last_error:
+                break
 
     append_failed_page(category_name, page_num, current_url, last_error or "unknown error")
     print(f"页面最终失败，已记录: {category_name} 第 {page_num} 页")
@@ -250,6 +279,7 @@ def open_page_with_retries(category_name, current_url, page_num):
 def crawl_category(category_url, category_name, remaining_limit=None):
     page_num = 1
     total_count = 0
+    session = requests.Session()
 
     while True:
         if remaining_limit is not None and total_count >= remaining_limit:
@@ -258,7 +288,10 @@ def crawl_category(category_url, category_name, remaining_limit=None):
         current_url = make_page_url(category_url, page_num)
         print(f"\n抓取分类 [{category_name}] 第 {page_num} 页")
 
-        html_text = open_page_with_retries(category_name, current_url, page_num)
+        if page_num > 1:
+            sleep_between_pages()
+
+        html_text = open_page_with_retries(session, category_name, current_url, page_num)
         if not html_text:
             page_num += 1
             continue
@@ -374,6 +407,8 @@ def main():
         )
         total_processed += category_total
         print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
+        if pd.notna(row["url"]):
+            sleep_between_categories()
 
     print("\n全部完成")
 
