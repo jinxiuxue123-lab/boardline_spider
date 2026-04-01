@@ -38,6 +38,14 @@ OPTION_REQUEST_TIMEOUT_SECONDS = 12
 IMAGE_REQUEST_TIMEOUT_SECONDS = 8
 ONE8_MAIN_LIST_SELECTOR = ".xans-product.xans-product-normalpackage .xans-product-listnormal ul.prdList.grid5"
 ONE8_MAIN_ITEM_SELECTOR = f"{ONE8_MAIN_LIST_SELECTOR} > li[id^='anchorBoxId_']"
+ONE8_FALLBACK_READY_SELECTOR = ",".join(
+    [
+        ".xans-product-listnormal ul.prdList > li[id^='anchorBoxId_']",
+        ".xans-product-normalpaging",
+        ".recommend_wrap ul.prdList > li[id^='anchorBoxId_']",
+        "li[id^='anchorBoxId_']",
+    ]
+)
 
 
 class CategoryPageLoadError(Exception):
@@ -510,6 +518,37 @@ def extract_product_items(page):
     return []
 
 
+def debug_page_state(page, current_url: str) -> None:
+    try:
+        current_page_url = page.url
+    except Exception:
+        current_page_url = ""
+    try:
+        title = clean_text(page.title() or "")
+    except Exception:
+        title = ""
+    try:
+        body_text = clean_text((page.locator("body").inner_text(timeout=3000) or "")[:500])
+    except Exception:
+        body_text = ""
+    try:
+        has_main_list = page.locator(".xans-product-listnormal").count() > 0
+    except Exception:
+        has_main_list = False
+    try:
+        any_items = page.locator("li[id^='anchorBoxId_']").count()
+    except Exception:
+        any_items = 0
+
+    print(
+        "页面诊断: "
+        f"请求url={current_url} | 实际url={current_page_url} | title={title} | "
+        f"has_main_list={has_main_list} | any_items={any_items}"
+    )
+    if body_text:
+        print(f"页面诊断文本: {body_text}")
+
+
 def extract_product_from_item(item, cate_no: str):
     link = item.query_selector("div.thumbnail a[href*='/product/']") or item.query_selector("a[href*='/product/']")
     if not link:
@@ -602,11 +641,12 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
         try:
             print("等待商品列表选择器...")
             page.wait_for_selector(
-                ONE8_MAIN_ITEM_SELECTOR,
+                ONE8_FALLBACK_READY_SELECTOR,
                 timeout=20000,
                 state="attached",
             )
         except Exception as e:
+            debug_page_state(page, current_url)
             raise CategoryPageLoadError(f"{current_url} | 商品列表未就绪: {e}") from e
         page.wait_for_timeout(1500)
 
@@ -614,6 +654,7 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
         product_links = page.query_selector_all(f"{ONE8_MAIN_LIST_SELECTOR} a[href*='/product/']")
         print(f"调试: 主列表商品项={len(product_items)} | 主列表链接={len(product_links)} | url={current_url}")
         if not product_items:
+            debug_page_state(page, current_url)
             break
 
         page_count = 0
