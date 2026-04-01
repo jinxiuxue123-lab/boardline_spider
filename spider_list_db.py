@@ -118,8 +118,6 @@ class BoardlineListParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.products = []
-        self._content_depth = 0
-        self._target_list_depth = 0
         self._in_td = False
         self._td_depth = 0
         self._current = None
@@ -130,23 +128,6 @@ class BoardlineListParser(HTMLParser):
         attrs_dict = dict(attrs)
         classes = attrs_dict.get("class", "")
         class_list = classes.split()
-
-        if tag == "div":
-            element_id = attrs_dict.get("id", "")
-            if element_id in {"contentWrap", "contentWrapper"}:
-                self._content_depth = 1
-            elif self._content_depth > 0:
-                self._content_depth += 1
-
-            if self._content_depth > 0 and "prd-list" in class_list and self._target_list_depth == 0:
-                self._target_list_depth = 1
-            elif self._target_list_depth > 0:
-                self._target_list_depth += 1
-            return
-
-        if self._target_list_depth == 0:
-            return
-
         if tag == "td":
             self._in_td = True
             self._td_depth += 1
@@ -171,16 +152,6 @@ class BoardlineListParser(HTMLParser):
             self._capture_name = True
 
     def handle_endtag(self, tag):
-        if tag == "div":
-            if self._target_list_depth > 0:
-                self._target_list_depth -= 1
-            if self._content_depth > 0:
-                self._content_depth -= 1
-            return
-
-        if self._target_list_depth == 0:
-            return
-
         if tag == "li" and self._capture_name:
             self._capture_name = False
             if self._current is not None:
@@ -197,7 +168,7 @@ class BoardlineListParser(HTMLParser):
                 self._current = None
 
     def handle_data(self, data):
-        if self._target_list_depth > 0 and self._capture_name:
+        if self._capture_name:
             self._name_parts.append(data)
 
 
