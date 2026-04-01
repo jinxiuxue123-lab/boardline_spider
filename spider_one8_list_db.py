@@ -703,6 +703,7 @@ def main():
             category_url = clean_text(str(row.get("url") or ""))
             if not category_name or not category_url:
                 continue
+            print(f"\n开始分类: {category_name} | 当前累计: {total_processed}")
             category_progress = progress.get(category_name, {})
             start_page = int(category_progress.get("next_page", 1) or 1)
             remaining_limit = None
@@ -723,6 +724,7 @@ def main():
             except Exception:
                 raise
             total_processed += category_total
+            print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
             clear_category_progress(category_name)
             if idx + 1 < len(categories_df):
                 next_row = categories_df.iloc[idx + 1]
