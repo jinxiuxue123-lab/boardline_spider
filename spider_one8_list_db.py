@@ -37,6 +37,16 @@ CATEGORY_SLEEP_MIN_SECONDS = 5.0
 CATEGORY_SLEEP_MAX_SECONDS = 8.0
 PAGE_REQUEST_TIMEOUT_SECONDS = 20
 PAGE_REQUEST_RETRIES = 2
+OPTION_REQUEST_TIMEOUT_SECONDS = 12
+IMAGE_REQUEST_TIMEOUT_SECONDS = 8
+
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0",
+        "Referer": BASE_URL,
+    }
+)
 
 
 class CategoryPageLoadError(Exception):
@@ -153,17 +163,13 @@ def download_image(image_url: str, branduid: str) -> str | None:
         return str(save_path)
 
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Referer": BASE_URL,
-        }
-        resp = requests.get(image_url, headers=headers, timeout=20)
+        resp = HTTP_SESSION.get(image_url, timeout=IMAGE_REQUEST_TIMEOUT_SECONDS)
         resp.raise_for_status()
         save_path.write_bytes(resp.content)
         print(f"下载成功: {branduid}")
         return str(save_path)
     except Exception as e:
-        print(f"下载失败: {image_url} | {e}")
+        print(f"下载跳过: {branduid} | {e}")
         return None
 
 
@@ -331,16 +337,15 @@ def fetch_option_stock(product_no: str, cate_no: str) -> str:
     if not product_no or not cate_no:
         return ""
     option_url = f"{BASE_URL}/product/basket_option.html?product_no={product_no}&sActionType=basket&cate_no={cate_no}"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": f"{BASE_URL}/product/list.html?cate_no={cate_no}",
-        "Connection": "close",
-    }
     html = ""
     last_error = None
     for attempt in range(1, OPTION_REQUEST_RETRIES + 1):
         try:
-            resp = requests.get(option_url, headers=headers, timeout=20)
+            resp = HTTP_SESSION.get(
+                option_url,
+                headers={"Referer": f"{BASE_URL}/product/list.html?cate_no={cate_no}"},
+                timeout=OPTION_REQUEST_TIMEOUT_SECONDS,
+            )
             resp.raise_for_status()
             html = resp.text
             break
@@ -605,7 +610,6 @@ def make_page_url(url: str, page_num: int) -> str:
 def fetch_category_html(session: requests.Session, current_url: str) -> str:
     response = session.get(
         current_url,
-        headers={"User-Agent": "Mozilla/5.0", "Referer": BASE_URL},
         timeout=PAGE_REQUEST_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
