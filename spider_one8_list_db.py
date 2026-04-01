@@ -144,6 +144,9 @@ def guess_ext(url: str) -> str:
 def download_image(image_url: str, branduid: str) -> str | None:
     if not image_url:
         return None
+    if "/mov/" in image_url.lower():
+        print(f"跳过视频封面图: {branduid} | {image_url}")
+        return None
 
     ext = guess_ext(image_url)
     save_dir = Path(f"data/images/{SOURCE_NAME}/{branduid}")
@@ -523,12 +526,16 @@ class One8ListParser(HTMLParser):
             if "/product/" in href and not self._current["href"]:
                 self._current["href"] = href
         elif tag == "img":
+            if "video_img" in class_list:
+                return
             image_url = (
                 attrs_dict.get("ec-data-src")
                 or attrs_dict.get("data-src")
                 or attrs_dict.get("src")
                 or ""
             ).strip()
+            if image_url and "/mov/" in image_url.lower():
+                image_url = ""
             if image_url and not self._current["image_url"]:
                 self._current["image_url"] = image_url
         elif tag == "div" and "description" in class_list:
@@ -620,6 +627,8 @@ def extract_product_items_from_html(html: str):
 
 def extract_product_from_item(item, cate_no: str):
     href = clean_text(item.get("href") or "")
+    if "/display/2/" in href:
+        return None
     branduid, product_url = normalize_product_url(href)
     if not branduid or not product_url:
         return None
