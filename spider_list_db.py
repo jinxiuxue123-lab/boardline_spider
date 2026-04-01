@@ -20,6 +20,16 @@ TEST_LIMIT = None
 FAILED_PAGES_FILE = "failed_list_pages.txt"
 MAX_PAGE_RETRIES = 3
 PLAYWRIGHT_HEADLESS = (os.getenv("PLAYWRIGHT_HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
+PAGE_GOTO_TIMEOUT_MS = 30000
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+BLOCKED_URL_KEYWORDS = (
+    "google-analytics",
+    "googletagmanager",
+    "doubleclick",
+    "facebook.net",
+    "analytics",
+    "gtag/js",
+)
 
 
 # ==========================
@@ -145,14 +155,21 @@ def load_failed_pages():
     return items
 
 
+def should_block_request(request) -> bool:
+    if request.resource_type in BLOCKED_RESOURCE_TYPES:
+        return True
+    lowered_url = request.url.lower()
+    return any(keyword in lowered_url for keyword in BLOCKED_URL_KEYWORDS)
+
+
 def open_page_with_retries(page, category_name, current_url, page_num):
     last_error = None
 
     for attempt in range(1, MAX_PAGE_RETRIES + 1):
         try:
             print(f"打开页面尝试 {attempt}/{MAX_PAGE_RETRIES}: {current_url}")
-            page.goto(current_url, timeout=60000)
-            page.wait_for_timeout(3000)
+            page.goto(current_url, timeout=PAGE_GOTO_TIMEOUT_MS, wait_until="domcontentloaded")
+            page.wait_for_timeout(1500)
             return True
         except Exception as e:
             last_error = str(e)
@@ -283,6 +300,7 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
         page = browser.new_page()
+        page.route("**/*", lambda route: route.abort() if should_block_request(route.request) else route.continue_())
 
         for _, row in categories_df.iterrows():
             if TEST_LIMIT is not None and total_processed >= TEST_LIMIT:
@@ -293,6 +311,8 @@ def main():
 
             if not category_url:
                 continue
+
+            print(f"\n开始分类: {category_name} | 当前累计: {total_processed}")
 
             remaining_limit = None
             if TEST_LIMIT is not None:
@@ -305,6 +325,7 @@ def main():
                 remaining_limit=remaining_limit,
             )
             total_processed += category_total
+            print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
 
         browser.close()
 
