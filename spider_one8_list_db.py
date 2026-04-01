@@ -37,6 +37,11 @@ CATEGORY_SLEEP_MAX_SECONDS = 8.0
 OPTION_REQUEST_TIMEOUT_SECONDS = 12
 IMAGE_REQUEST_TIMEOUT_SECONDS = 8
 DEBUG_DIR = Path("logs/one8_debug")
+REALISTIC_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/122.0.0.0 Safari/537.36"
+)
 
 
 class CategoryPageLoadError(Exception):
@@ -97,6 +102,33 @@ def wait_for_product_markup(page, timeout_ms: int = 60000, interval_ms: int = 30
         page.wait_for_timeout(interval_ms)
 
     return False
+
+
+def auto_scroll(page) -> None:
+    try:
+        page.evaluate(
+            """
+            async () => {
+              await new Promise((resolve) => {
+                let totalHeight = 0;
+                const distance = 200;
+                const timer = setInterval(() => {
+                  const scrollHeight = document.body ? document.body.scrollHeight : 0;
+                  window.scrollBy(0, distance);
+                  totalHeight += distance;
+                  if (totalHeight >= scrollHeight) {
+                    clearInterval(timer);
+                    window.scrollTo(0, 0);
+                    resolve();
+                  }
+                }, 120);
+              });
+            }
+            """
+        )
+        print("已执行页面滚动触发")
+    except Exception as e:
+        print(f"页面滚动触发失败: {e}")
 
 
 def upsert_one8_product_update_with_change_log(
@@ -631,6 +663,7 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
         try:
             print(f"打开页面: {current_url}")
             page.goto(current_url, timeout=25000, wait_until="commit")
+            auto_scroll(page)
         except Exception as e:
             print(f"页面加载异常，重试一次: {current_url} | {e}")
             save_debug_artifacts(page, category_name, page_num, "goto_retry")
@@ -638,6 +671,7 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
                 sleep_between_pages()
                 print(f"重新打开页面: {current_url}")
                 page.goto(current_url, timeout=20000, wait_until="commit")
+                auto_scroll(page)
             except Exception as retry_error:
                 save_debug_artifacts(page, category_name, page_num, "goto_failed")
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
@@ -768,12 +802,58 @@ def main():
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=not args.headed,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ],
         )
-        context = browser.new_context()
+        context = browser.new_context(
+            user_agent=REALISTIC_USER_AGENT,
+            viewport={"width": 1920, "height": 1080},
+            locale="ko-KR",
+            timezone_id="Asia/Seoul",
+        )
+        context.set_extra_http_headers(
+            {
+                "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Upgrade-Insecure-Requests": "1",
+            }
+        )
+        context.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+            Object.defineProperty(navigator, 'language', { get: () => 'ko-KR' });
+            Object.defineProperty(navigator, 'languages', { get: () => ['ko-KR', 'ko', 'en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', {
+              get: () => [
+                { name: 'Chrome PDF Plugin' },
+                { name: 'Chrome PDF Viewer' },
+                { name: 'Native Client' }
+              ]
+            });
+            window.chrome = window.chrome || { runtime: {} };
+            """
+        )
         page = context.new_page()
         page.set_default_navigation_timeout(45000)
         page.set_default_timeout(15000)
+        logged_response_urls = set()
+
+        def log_response(response):
+            try:
+                url = response.url
+                lower_url = url.lower()
+                if any(token in lower_url for token in ("product/list", "exec/front", "category", ".js", ".json")):
+                    key = (response.status, url)
+                    if key not in logged_response_urls and len(logged_response_urls) < 30:
+                        logged_response_urls.add(key)
+                        print(f"响应: {response.status} | {url}")
+            except Exception:
+                return
+
+        page.on("response", log_response)
 
         for idx, row in categories_df.iterrows():
             if idx < start_index:
