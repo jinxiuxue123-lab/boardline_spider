@@ -7,7 +7,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/boardline_spider
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/bin/zsh /root/boardline_spider/scripts/run_admin_server.sh
+ExecStart=/bin/bash /root/boardline_spider/scripts/run_admin_server.sh
 Restart=always
 RestartSec=5
 

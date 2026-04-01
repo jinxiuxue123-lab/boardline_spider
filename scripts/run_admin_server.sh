@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -17,7 +17,7 @@ if [ -n "${ALIYUN_OSS_ENDPOINT:-}" ]; then
   NO_PROXY_HOSTS="$NO_PROXY_HOSTS,${ALIYUN_OSS_ENDPOINT}"
 fi
 if [ -n "${XIANYU_IMAGE_CDN_BASE_URL:-}" ]; then
-  CDN_HOST="$(python3 - <<'PY'
+  CDN_HOST="$("$PROJECT_ROOT/.venv/bin/python" - <<'PY'
 from urllib.parse import urlparse
 import os
 value = os.getenv("XIANYU_IMAGE_CDN_BASE_URL", "").strip()
@@ -41,4 +41,4 @@ else
 fi
 
 cd "$PROJECT_ROOT"
-python3 scripts/run_xianyu_admin_server.py --host 0.0.0.0 --port 8790
+"$PROJECT_ROOT/.venv/bin/python" scripts/run_xianyu_admin_server.py --host 0.0.0.0 --port 8790
