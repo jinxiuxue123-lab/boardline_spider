@@ -2,8 +2,10 @@ from datetime import datetime
 import argparse
 import json
 from pathlib import Path
+import random
 import re
 import sqlite3
+import time
 from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 
 import pandas as pd
@@ -29,10 +31,26 @@ OPTION_REQUEST_RETRIES = 3
 PROGRESS_FILE = "one8_list_progress.json"
 DB_FILE = "products.db"
 EXPORT_FILE = "one8_products.xlsx"
+PAGE_SLEEP_MIN_SECONDS = 2.0
+PAGE_SLEEP_MAX_SECONDS = 4.0
+CATEGORY_SLEEP_MIN_SECONDS = 5.0
+CATEGORY_SLEEP_MAX_SECONDS = 8.0
 
 
 class CategoryPageLoadError(Exception):
     pass
+
+
+def sleep_between_pages() -> None:
+    delay = random.uniform(PAGE_SLEEP_MIN_SECONDS, PAGE_SLEEP_MAX_SECONDS)
+    print(f"页面间隔休眠: {delay:.1f}s")
+    time.sleep(delay)
+
+
+def sleep_between_categories() -> None:
+    delay = random.uniform(CATEGORY_SLEEP_MIN_SECONDS, CATEGORY_SLEEP_MAX_SECONDS)
+    print(f"分类间隔休眠: {delay:.1f}s")
+    time.sleep(delay)
 
 
 def upsert_one8_product_update_with_change_log(
@@ -562,19 +580,25 @@ def crawl_category(page, category_url: str, category_name: str, remaining_limit=
 
         current_url = make_page_url(category_url, page_num)
         print(f"\n抓取分类 [{category_name}] 第 {page_num} 页")
+        if page_num > start_page:
+            sleep_between_pages()
         try:
+            print(f"打开页面: {current_url}")
             page.goto(current_url, timeout=45000, wait_until="domcontentloaded")
         except Exception as e:
             print(f"页面加载异常，重试一次: {current_url} | {e}")
             try:
+                sleep_between_pages()
+                print(f"重新打开页面: {current_url}")
                 page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
             except Exception as retry_error:
                 raise CategoryPageLoadError(f"{current_url} | {retry_error}") from retry_error
         try:
+            print("等待商品列表选择器...")
             page.wait_for_selector("ul.prdList, .ec-base-product", timeout=15000)
         except Exception:
             pass
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(800)
 
         product_items = extract_product_items(page)
         product_links = page.query_selector_all("ul.prdList a[href*='/product/']")
@@ -692,7 +716,24 @@ def main():
                 break
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headed)
-        page = browser.new_page()
+        context = browser.new_context()
+
+        def route_handler(route):
+            request = route.request
+            resource_type = request.resource_type
+            url = request.url.lower()
+            if resource_type in {"image", "media", "font"}:
+                route.abort()
+                return
+            if any(token in url for token in ("google-analytics", "googletagmanager", "doubleclick", "facebook.net", "analytics")):
+                route.abort()
+                return
+            route.continue_()
+
+        context.route("**/*", route_handler)
+        page = context.new_page()
+        page.set_default_navigation_timeout(45000)
+        page.set_default_timeout(15000)
 
         for idx, row in categories_df.iterrows():
             if idx < start_index:
@@ -727,11 +768,14 @@ def main():
             print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
             clear_category_progress(category_name)
             if idx + 1 < len(categories_df):
+                sleep_between_categories()
+            if idx + 1 < len(categories_df):
                 next_row = categories_df.iloc[idx + 1]
                 next_name = clean_text(str(next_row.get("name") or ""))
                 if next_name:
                     update_category_progress(next_name, 1)
 
+        context.close()
         browser.close()
 
     if completed_all:
