@@ -74,7 +74,6 @@ def save_debug_artifacts(page, category_name: str, page_num: int, stage: str) ->
 
 def wait_for_product_markup(page, timeout_ms: int = 60000, interval_ms: int = 3000) -> bool:
     deadline = time.time() + (timeout_ms / 1000)
-    page.wait_for_selector("body", timeout=min(timeout_ms, 15000), state="attached")
     round_no = 0
     while time.time() < deadline:
         round_no += 1
