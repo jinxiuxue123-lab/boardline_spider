@@ -1,3 +1,5 @@
+import os
+
 from playwright.sync_api import sync_playwright
 import pandas as pd
 import re
@@ -5,6 +7,7 @@ from db_utils import get_product_by_branduid
 
 BASE_URL = "http://www.boardline.co.kr"
 CHECK_TOP_N = 20
+PLAYWRIGHT_HEADLESS = (os.getenv("PLAYWRIGHT_HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
 
 
 def extract_branduid(url):
@@ -73,7 +76,7 @@ def main():
     categories_with_new = []
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
+        browser = p.chromium.launch(headless=PLAYWRIGHT_HEADLESS)
         page = browser.new_page()
 
         for _, row in categories_df.iterrows():
