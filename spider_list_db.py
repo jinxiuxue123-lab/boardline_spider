@@ -118,7 +118,7 @@ class BoardlineListParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.products = []
-        self._content_wrap_depth = 0
+        self._content_depth = 0
         self._target_list_depth = 0
         self._in_td = False
         self._td_depth = 0
@@ -133,12 +133,12 @@ class BoardlineListParser(HTMLParser):
 
         if tag == "div":
             element_id = attrs_dict.get("id", "")
-            if element_id == "contentWrap":
-                self._content_wrap_depth = 1
-            elif self._content_wrap_depth > 0:
-                self._content_wrap_depth += 1
+            if element_id in {"contentWrap", "contentWrapper"}:
+                self._content_depth = 1
+            elif self._content_depth > 0:
+                self._content_depth += 1
 
-            if self._content_wrap_depth > 0 and "prd-list" in class_list and self._target_list_depth == 0:
+            if self._content_depth > 0 and "prd-list" in class_list and self._target_list_depth == 0:
                 self._target_list_depth = 1
             elif self._target_list_depth > 0:
                 self._target_list_depth += 1
@@ -174,8 +174,8 @@ class BoardlineListParser(HTMLParser):
         if tag == "div":
             if self._target_list_depth > 0:
                 self._target_list_depth -= 1
-            if self._content_wrap_depth > 0:
-                self._content_wrap_depth -= 1
+            if self._content_depth > 0:
+                self._content_depth -= 1
             return
 
         if self._target_list_depth == 0:

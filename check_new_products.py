@@ -43,7 +43,27 @@ def fetch_category_html(category_name: str, category_url: str) -> str:
 
 
 def extract_first_page_branduids(html: str) -> list[str]:
-    href_matches = re.findall(r'href="([^"]*branduid=\d+[^"]*)"', html or "", flags=re.I)
+    html = html or ""
+
+    # 优先只取正式商品列表区域，避免抓到顶部导航/推荐区。
+    block_match = re.search(
+        r'<div id="contentWrap".*?<div class="prd-list.*?</table>',
+        html,
+        flags=re.I | re.S,
+    )
+    if not block_match:
+        block_match = re.search(
+            r'<div id="contentWrapper".*?<div class="prd-list.*?</table>',
+            html,
+            flags=re.I | re.S,
+        )
+
+    target_html = block_match.group(0) if block_match else html
+    href_matches = re.findall(
+        r'href="([^"]*shopdetail\.html\?[^"]*branduid=\d+[^"]*)"',
+        target_html,
+        flags=re.I,
+    )
     branduids: list[str] = []
     seen: set[str] = set()
     for href in href_matches:
