@@ -20,6 +20,13 @@ def normalize_match_text(text: str) -> str:
     return " ".join(text.split())
 
 
+def keyword_tokens(text: str) -> list[str]:
+    normalized = normalize_match_text(text)
+    if not normalized:
+        return []
+    return [token for token in normalized.split(" ") if token]
+
+
 def parse_price_value(price_text: str) -> int | None:
     if not price_text:
         return None
@@ -76,6 +83,7 @@ def load_discount_rules(file_path: str = RULES_FILE) -> list[dict]:
             "category_normalized": category.strip(),
             "keyword": keyword,
             "keyword_normalized": normalize_match_text(keyword),
+            "keyword_tokens": keyword_tokens(keyword),
             "discount_type": discount_type,
             "discount_value": discount_value,
             "priority": priority,
@@ -88,6 +96,7 @@ def load_discount_rules(file_path: str = RULES_FILE) -> list[dict]:
 
 def find_matching_discount_rule(product_name: str, category: str, rules: list[dict]) -> dict | None:
     normalized_name = normalize_match_text(product_name)
+    name_tokens = set(keyword_tokens(product_name))
     normalized_category = str(category or "").strip()
 
     category_only_match = None
@@ -96,6 +105,9 @@ def find_matching_discount_rule(product_name: str, category: str, rules: list[di
         if rule_category and rule_category != normalized_category:
             continue
         keyword = rule.get("keyword_normalized", "")
+        rule_tokens = rule.get("keyword_tokens") or []
+        if rule_tokens and all(token in name_tokens for token in rule_tokens):
+            return rule
         if keyword and keyword in normalized_name:
             return rule
         if not keyword and category_only_match is None:
