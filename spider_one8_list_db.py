@@ -37,6 +37,7 @@ CATEGORY_SLEEP_MIN_SECONDS = 5.0
 CATEGORY_SLEEP_MAX_SECONDS = 8.0
 PAGE_REQUEST_TIMEOUT_SECONDS = 20
 PAGE_REQUEST_RETRIES = 2
+DETAIL_REQUEST_TIMEOUT_SECONDS = 20
 
 
 class CategoryPageLoadError(Exception):
@@ -101,6 +102,7 @@ def export_one8_inventory_excel() -> int:
         p.branduid,
         p.category,
         p.name,
+        p.color,
         p.url,
         p.image_url,
         p.local_image_path,
@@ -128,6 +130,17 @@ def export_one8_inventory_excel() -> int:
     conn.close()
     df.to_excel(EXPORT_FILE, index=False)
     return len(df)
+
+
+def ensure_products_color_column() -> None:
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA table_info(products)")
+    product_columns = {row[1] for row in cursor.fetchall()}
+    if "color" not in product_columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN color TEXT")
+        conn.commit()
+    conn.close()
 
 
 def guess_ext(url: str) -> str:
@@ -630,6 +643,29 @@ def fetch_category_html(session: requests.Session, current_url: str) -> str:
     return response.text
 
 
+def fetch_product_color(session: requests.Session, product_url: str) -> str:
+    if not product_url:
+        return ""
+    response = session.get(
+        product_url,
+        headers={"User-Agent": "Mozilla/5.0", "Referer": BASE_URL},
+        timeout=DETAIL_REQUEST_TIMEOUT_SECONDS,
+    )
+    response.raise_for_status()
+    html = response.text
+    match = re.search(
+        r'<li[^>]*>\s*<span[^>]*class="title"[^>]*>\s*제품 스펙\s*</span>\s*<span[^>]*>(.*?)</span>\s*</li>',
+        html,
+        re.I | re.S,
+    )
+    if not match:
+        return ""
+    raw_value = match.group(1)
+    raw_value = re.sub(r"<span[^>]*class=\"displaynone\"[^>]*>.*?</span>", " ", raw_value, flags=re.I | re.S)
+    raw_value = re.sub(r"<[^>]+>", " ", raw_value)
+    return clean_text(unescape(raw_value))
+
+
 def extract_product_items_from_html(html: str):
     parser = One8ListParser()
     parser.feed(html or "")
@@ -654,6 +690,7 @@ def extract_product_from_item(item, cate_no: str):
         "cate_no": cate_no,
         "url": product_url,
         "name": name,
+        "color": "",
         "image_url": image_url,
         "original_price": clean_text(item.get("original_price") or ""),
         "discount_price": clean_text(item.get("discount_price") or ""),
@@ -669,6 +706,7 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
     stop_category = False
     consecutive_sold_out = 0
     session = requests.Session()
+    color_cache: dict[str, str] = {}
 
     while True:
         if remaining_limit is not None and total_count >= remaining_limit:
@@ -718,6 +756,13 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
                 page_skipped += 1
                 continue
             try:
+                if product["url"] not in color_cache:
+                    try:
+                        color_cache[product["url"]] = fetch_product_color(session, product["url"])
+                    except Exception as color_error:
+                        print(f"颜色抓取失败: {product['branduid']} | {color_error}")
+                        color_cache[product["url"]] = ""
+                product["color"] = color_cache.get(product["url"], "")
                 local_image_path = download_image(product["image_url"], product["branduid"])
                 today = datetime.now().strftime("%Y-%m-%d")
                 existing = get_product_by_branduid(SOURCE_NAME, product["branduid"])
@@ -727,6 +772,7 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
                         branduid=product["branduid"],
                         category=category_name,
                         name=product["name"],
+                        color=product["color"],
                         url=product["url"],
                         image_url=product["image_url"],
                         local_image_path=local_image_path,
@@ -741,6 +787,7 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
                         branduid=product["branduid"],
                         category=category_name,
                         name=product["name"],
+                        color=product["color"],
                         url=product["url"],
                         image_url=product["image_url"],
                         local_image_path=local_image_path,
@@ -786,6 +833,7 @@ def main():
     parser = argparse.ArgumentParser(description="抓取 one8 分类商品")
     parser.add_argument("--headed", action="store_true", help="打开浏览器窗口运行，默认无头模式")
     args = parser.parse_args()
+    ensure_products_color_column()
 
     total_processed = 0
     progress = read_progress()

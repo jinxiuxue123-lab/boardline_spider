@@ -36,6 +36,7 @@ def insert_product(
     branduid: str,
     category: str,
     name: str,
+    color: str,
     url: str,
     image_url: str,
     local_image_path: Optional[str] = None,
@@ -52,6 +53,7 @@ def insert_product(
             branduid,
             category,
             name,
+            color,
             url,
             image_url,
             local_image_path,
@@ -61,12 +63,13 @@ def insert_product(
             last_seen,
             missing_days
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, 0)
     """, (
         source,
         branduid,
         category,
         name,
+        color,
         url,
         image_url,
         local_image_path,
@@ -87,6 +90,7 @@ def update_product_basic(
     branduid: str,
     category: str,
     name: str,
+    color: str,
     url: str,
     image_url: str,
     local_image_path: Optional[str] = None,
@@ -102,6 +106,7 @@ def update_product_basic(
             UPDATE products
             SET category = ?,
                 name = ?,
+                color = ?,
                 url = ?,
                 image_url = ?,
                 local_image_path = ?,
@@ -114,6 +119,7 @@ def update_product_basic(
         """, (
             category,
             name,
+            color,
             url,
             image_url,
             local_image_path,
@@ -127,6 +133,7 @@ def update_product_basic(
             UPDATE products
             SET category = ?,
                 name = ?,
+                color = ?,
                 url = ?,
                 image_url = ?,
                 status = 'active',
@@ -137,6 +144,7 @@ def update_product_basic(
         """, (
             category,
             name,
+            color,
             url,
             image_url,
             last_seen,

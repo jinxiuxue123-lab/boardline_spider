@@ -20,6 +20,7 @@ def init_db() -> None:
 
         category TEXT,
         name TEXT,
+        color TEXT,
         url TEXT NOT NULL,
 
         -- 原始图片URL
@@ -452,6 +453,11 @@ def init_db() -> None:
         cursor.execute("""
         ALTER TABLE products
         ADD COLUMN detail_image_fetched INTEGER DEFAULT 0
+        """)
+    if "color" not in product_columns:
+        cursor.execute("""
+        ALTER TABLE products
+        ADD COLUMN color TEXT
         """)
     if "exchange_rate" not in columns:
         cursor.execute("""
