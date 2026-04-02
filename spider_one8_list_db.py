@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 import pandas as pd
 import requests
 
+from discount_rules import find_matching_discount_rule, load_discount_rules
 from db_utils import (
     get_latest_update,
     get_product_by_branduid,
@@ -31,6 +32,7 @@ OPTION_REQUEST_RETRIES = 3
 PROGRESS_FILE = "one8_list_progress.json"
 DB_FILE = "products.db"
 EXPORT_FILE = "one8_products.xlsx"
+DISCOUNT_RULES_FILE = "one8_discount_rules.xlsx"
 PAGE_SLEEP_MIN_SECONDS = 2.0
 PAGE_SLEEP_MAX_SECONDS = 4.0
 CATEGORY_SLEEP_MIN_SECONDS = 5.0
@@ -128,6 +130,17 @@ def export_one8_inventory_excel() -> int:
     """
     df = pd.read_sql_query(sql, conn, params=(SOURCE_NAME,))
     conn.close()
+    discount_rules = load_discount_rules(DISCOUNT_RULES_FILE)
+    df["applied_discount"] = df.apply(
+        lambda row: format_applied_discount_text(
+            find_matching_discount_rule(
+                str(row.get("name") or ""),
+                str(row.get("category") or ""),
+                discount_rules,
+            )
+        ),
+        axis=1,
+    )
     df.to_excel(EXPORT_FILE, index=False)
     return len(df)
 
@@ -141,6 +154,39 @@ def ensure_products_color_column() -> None:
         cursor.execute("ALTER TABLE products ADD COLUMN color TEXT")
         conn.commit()
     conn.close()
+
+
+def format_applied_discount_text(rule: dict | None) -> str:
+    if not rule:
+        return ""
+
+    discount_type = str(rule.get("discount_type") or "").lower()
+    discount_value = rule.get("discount_value")
+    keyword = clean_text(str(rule.get("keyword") or ""))
+    note = clean_text(str(rule.get("note") or ""))
+
+    if discount_type == "rate":
+        try:
+            rate = float(discount_value)
+        except (TypeError, ValueError):
+            rate_text = ""
+        else:
+            if rate <= 1:
+                rate_text = f"{rate * 10:g}折"
+            else:
+                rate_text = f"{rate:g}%"
+    elif discount_type == "amount":
+        try:
+            amount = int(round(float(discount_value)))
+        except (TypeError, ValueError):
+            rate_text = ""
+        else:
+            rate_text = f"减{amount:,}韩元"
+    else:
+        rate_text = ""
+
+    parts = [part for part in [keyword, rate_text, note] if part]
+    return " | ".join(parts)
 
 
 def guess_ext(url: str) -> str:
