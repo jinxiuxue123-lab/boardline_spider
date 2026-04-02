@@ -258,6 +258,7 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
         ORDER BY p.category, p.id
         """
     ).fetchall()
+    normalized_account_name = (account_name or "").strip()
     ai_rows = conn.execute(
         """
         SELECT product_id, id AS image_id, ai_main_image_path, is_selected, COALESCE(account_name, '') AS account_name, COALESCE(asset_type, 'main') AS asset_type
@@ -265,7 +266,7 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
         WHERE COALESCE(account_name, '') = ?
         ORDER BY id DESC
         """,
-        (account_name or "",),
+        (normalized_account_name,),
     ).fetchall()
     conn.close()
 
@@ -273,19 +274,26 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
     detail_ai_map = {}
     for row in ai_rows:
         pid = int(row["product_id"])
+        image_account_name = str(row["account_name"] or "").strip()
         item = {
             "id": int(row["image_id"]),
             "path": str(row["ai_main_image_path"] or "").strip(),
             "selected": int(row["is_selected"] or 0),
-            "account_name": str(row["account_name"] or "").strip(),
+            "account_name": image_account_name,
             "asset_type": str(row["asset_type"] or "main").strip() or "main",
         }
         target_map = detail_ai_map if item["asset_type"] == "detail" else main_ai_map
-        target_map.setdefault(pid, []).append(
+        target_map.setdefault((pid, image_account_name), []).append(
             {
                 **item,
             }
         )
+
+    def resolve_ai_images(target_map: dict, product_id: int) -> list[dict]:
+        if normalized_account_name:
+            return target_map.get((int(product_id), normalized_account_name), [])
+        return target_map.get((int(product_id), ""), []) or []
+
     import pandas as pd
     df = pd.DataFrame([dict(row) for row in rows])
     if df.empty:
@@ -294,10 +302,10 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
         df["ai_main_image_path"] = []
         return df
     df = df.copy()
-    df["ai_images_json"] = df["product_id"].apply(lambda pid: json.dumps(main_ai_map.get(int(pid), []), ensure_ascii=False))
-    df["ai_detail_images_json"] = df["product_id"].apply(lambda pid: json.dumps(detail_ai_map.get(int(pid), []), ensure_ascii=False))
+    df["ai_images_json"] = df["product_id"].apply(lambda pid: json.dumps(resolve_ai_images(main_ai_map, int(pid)), ensure_ascii=False))
+    df["ai_detail_images_json"] = df["product_id"].apply(lambda pid: json.dumps(resolve_ai_images(detail_ai_map, int(pid)), ensure_ascii=False))
     df["ai_main_image_path"] = df["product_id"].apply(
-        lambda pid: (main_ai_map.get(int(pid), [{}])[0].get("path", "") if main_ai_map.get(int(pid)) else "")
+        lambda pid: (resolve_ai_images(main_ai_map, int(pid))[0].get("path", "") if resolve_ai_images(main_ai_map, int(pid)) else "")
     )
     return df
 

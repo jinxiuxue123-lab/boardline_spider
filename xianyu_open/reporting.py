@@ -107,6 +107,45 @@ def ensure_account_ai_copy_support():
     conn.close()
 
 
+def _build_ai_image_map(rows: pd.DataFrame, include_fallback_empty: bool = False) -> dict:
+    ai_map = {}
+    if rows.empty:
+        return ai_map
+
+    if include_fallback_empty:
+        grouped = rows.groupby(["product_id", "account_name"])
+        for (product_id, account_name), group in grouped:
+            items = []
+            for _, row in group.iterrows():
+                items.append({
+                    "id": int(row["image_id"]),
+                    "path": str(row["ai_main_image_path"] or "").strip(),
+                    "selected": int(row["is_selected"] or 0),
+                    "account_name": str(row["account_name"] or "").strip(),
+                })
+            ai_map[(int(product_id), str(account_name or ""))] = items
+        return ai_map
+
+    for product_id, group in rows.groupby("product_id"):
+        items = []
+        for _, row in group.iterrows():
+            items.append({
+                "id": int(row["image_id"]),
+                "path": str(row["ai_main_image_path"] or "").strip(),
+                "selected": int(row["is_selected"] or 0),
+                "account_name": str(row["account_name"] or "").strip(),
+            })
+        ai_map[int(product_id)] = items
+    return ai_map
+
+
+def _resolve_ai_images(ai_map: dict, product_id: int, account_name: str = "") -> list[dict]:
+    normalized_account = str(account_name or "").strip()
+    if normalized_account:
+        return ai_map.get((int(product_id), normalized_account), [])
+    return ai_map.get(int(product_id), []) or ai_map.get((int(product_id), ""), []) or []
+
+
 def load_account_summary(account_name: str = "") -> pd.DataFrame:
     ensure_account_ai_copy_support()
     conn = get_connection()
@@ -210,31 +249,21 @@ def load_task_details(account_name: str = "") -> pd.DataFrame:
     """, conn)
     conn.close()
 
-    ai_map = {}
-    if not ai_rows.empty:
-        for (product_id, image_account_name), group in ai_rows.groupby(["product_id", "account_name"]):
-            items = []
-            for _, row in group.iterrows():
-                items.append({
-                    "id": int(row["image_id"]),
-                    "path": str(row["ai_main_image_path"] or "").strip(),
-                    "selected": int(row["is_selected"] or 0),
-                })
-            ai_map[(int(product_id), str(image_account_name or ""))] = items
+    ai_map = _build_ai_image_map(ai_rows, include_fallback_empty=True)
 
     if not df.empty:
         df = df.copy()
         df["ai_images_json"] = df.apply(
             lambda row: json.dumps(
-                ai_map.get((int(row["product_id"]), str(row["account_name"] or "")), []),
+                _resolve_ai_images(ai_map, int(row["product_id"]), str(row["account_name"] or "")),
                 ensure_ascii=False,
             ),
             axis=1,
         )
         df["ai_main_image_path"] = df.apply(
             lambda row: (
-                ai_map.get((int(row["product_id"]), str(row["account_name"] or "")), [{}])[0].get("path", "")
-                if ai_map.get((int(row["product_id"]), str(row["account_name"] or "")))
+                _resolve_ai_images(ai_map, int(row["product_id"]), str(row["account_name"] or ""))[0].get("path", "")
+                if _resolve_ai_images(ai_map, int(row["product_id"]), str(row["account_name"] or ""))
                 else ""
             ),
             axis=1,
@@ -333,18 +362,7 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
     """, conn, params=[account_name])
     conn.close()
 
-    ai_map = {}
-    if not ai_rows.empty:
-        for product_id, group in ai_rows.groupby("product_id"):
-            items = []
-            for _, row in group.iterrows():
-                items.append({
-                    "id": int(row["image_id"]),
-                    "path": str(row["ai_main_image_path"] or "").strip(),
-                    "selected": int(row["is_selected"] or 0),
-                    "account_name": str(row["account_name"] or "").strip(),
-                })
-            ai_map[int(product_id)] = items
+    ai_map = _build_ai_image_map(ai_rows)
 
     if not df.empty:
         df = df.copy()
