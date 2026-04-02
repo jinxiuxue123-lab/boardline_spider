@@ -480,6 +480,7 @@ class One8ListParser(HTMLParser):
     def __init__(self):
         super().__init__()
         self.products = []
+        self._normal_section_depth = 0
         self._in_item = False
         self._item_depth = 0
         self._current = None
@@ -495,7 +496,12 @@ class One8ListParser(HTMLParser):
         class_attr = attrs_dict.get("class", "")
         class_list = class_attr.split()
 
-        if tag == "li" and (attrs_dict.get("id") or "").startswith("anchorBoxId_"):
+        if tag == "div" and "xans-product-listnormal" in class_list:
+            self._normal_section_depth = 1
+        elif self._normal_section_depth > 0:
+            self._normal_section_depth += 1
+
+        if self._normal_section_depth > 0 and tag == "li" and (attrs_dict.get("id") or "").startswith("anchorBoxId_"):
             self._in_item = True
             self._item_depth = 1
             self._current = {
@@ -552,6 +558,11 @@ class One8ListParser(HTMLParser):
             self._discount_note_parts = []
 
     def handle_endtag(self, tag):
+        if not self._in_item and self._normal_section_depth > 0:
+            self._normal_section_depth -= 1
+            if self._normal_section_depth < 0:
+                self._normal_section_depth = 0
+
         if not self._in_item or self._current is None:
             return
 
