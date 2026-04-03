@@ -47,8 +47,8 @@ DETAIL_DEBUG_DIR = Path("logs/boardline_detail_debug")
 DETAIL_REQUEST_MIN_INTERVAL_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_MIN_INTERVAL", "1.2"))
 DETAIL_REQUEST_RETRY_COUNT = int(os.getenv("BOARDLINE_DETAIL_REQUEST_RETRY_COUNT", "3"))
 DETAIL_REQUEST_BACKOFF_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_BACKOFF_SECONDS", "2.5"))
-DETAIL_REQUEST_SLEEP_MIN_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_SLEEP_MIN", "5.0"))
-DETAIL_REQUEST_SLEEP_MAX_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_SLEEP_MAX", "7.5"))
+DETAIL_REQUEST_SLEEP_MIN_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_SLEEP_MIN", "2.5"))
+DETAIL_REQUEST_SLEEP_MAX_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_SLEEP_MAX", "3.75"))
 DETAIL_REQUEST_LOCK = threading.Lock()
 DETAIL_LAST_REQUEST_AT = 0.0
 
@@ -69,8 +69,8 @@ def clean_option_text(text, preserve_numeric_parens=False):
     if not text:
         return ""
     text = text.strip()
-    # 只清理类似 "1. 选项名" 这种序号前缀，避免把鞋码 7.5 误清成 5
-    text = re.sub(r"^\d+\.\s+", "", text)
+    # 只清理类似 "1.选项名" / "1. 选项名" 这种序号前缀，避免把鞋码 7.5 误清成 5
+    text = re.sub(r"^\d+\.\s*", "", text)
     if not preserve_numeric_parens:
         text = re.sub(r"\(\s*[+\-]?\d[\d,\s]*\)", "", text)
     text = re.sub(r"\(\)", "", text)
@@ -481,6 +481,67 @@ def parse_stock_from_script_data(html_text, preserve_numeric_parens=False):
     return result
 
 
+def parse_stockinfo_map(html_text):
+    match = re.search(r"var\s+stockInfo\s*=\s*(\{.*?\})\s*;", html_text or "", flags=re.I | re.S)
+    if not match:
+        return {}
+
+    stock_map = {}
+    for key, value in re.findall(r'"([^"]+)"\s*:\s*(-?\d+)', match.group(1)):
+        try:
+            stock_map[key] = int(value)
+        except ValueError:
+            continue
+    return stock_map
+
+
+def parse_stock_two_level_from_options(select0_options, select1_options, stockinfo_map, preserve_numeric_parens=False):
+    if not select0_options or not select1_options or not stockinfo_map:
+        return []
+
+    stock_map = {}
+    valid_first = []
+    valid_second = []
+
+    for opt in select0_options:
+        if is_placeholder_option(opt.get("text"), opt.get("value")):
+            continue
+        valid_first.append(opt)
+
+    for opt in select1_options:
+        if is_placeholder_option(opt.get("text"), opt.get("value")):
+            continue
+        valid_second.append(opt)
+
+    for first_index, first_opt in enumerate(valid_first):
+        first_name = clean_option_text(first_opt.get("text") or "", preserve_numeric_parens=preserve_numeric_parens)
+        if not first_name:
+            continue
+
+        sizes = []
+        for second_index, second_opt in enumerate(valid_second):
+            qty = stockinfo_map.get(f"{first_index},{second_index}")
+            if qty is None or qty <= 0:
+                continue
+
+            second_name = clean_option_text(second_opt.get("text") or "", preserve_numeric_parens=preserve_numeric_parens)
+            if not second_name:
+                continue
+
+            sizes.append(f"{second_name}:{qty}")
+
+        if sizes:
+            stock_map[first_name] = sizes
+
+    if not stock_map:
+        return []
+
+    result = []
+    for first_name, sizes in stock_map.items():
+        result.append(f"{first_name}({','.join(sizes)})")
+    return result
+
+
 def html_has_soldout_marker(html_text):
     lowered = (html_text or "").lower()
     return any(marker in lowered for marker in ("품절", "sold out", "soldout"))
@@ -634,6 +695,9 @@ def fetch_detail_via_requests_sync(product_tuple):
     preserve_numeric_parens = "滑雪鞋" in (category or "")
     select0_html = extract_select_html(html_text, "MK_p_s_0")
     select1_html = extract_select_html(html_text, "MK_p_s_1")
+    select0_options = extract_option_items(select0_html)
+    select1_options = extract_option_items(select1_html)
+    stockinfo_map = parse_stockinfo_map(html_text)
     script_stock_items = parse_stock_from_script_data(
         html_text,
         preserve_numeric_parens=preserve_numeric_parens,
@@ -643,20 +707,28 @@ def fetch_detail_via_requests_sync(product_tuple):
     used_requests = False
     if "滑雪板" in (category or ""):
         stock_items = parse_stock_single_from_options(
-            extract_option_items(select0_html),
+            select0_options,
+            preserve_numeric_parens=preserve_numeric_parens,
+        )
+        used_requests = True
+    elif select0_options and select1_options and stockinfo_map:
+        stock_items = parse_stock_two_level_from_options(
+            select0_options,
+            select1_options,
+            stockinfo_map,
             preserve_numeric_parens=preserve_numeric_parens,
         )
         used_requests = True
     elif script_stock_items:
         stock_items = script_stock_items
         used_requests = True
-    elif select0_html and not select1_html:
+    elif select0_options and not select1_options:
         stock_items = parse_stock_single_from_options(
-            extract_option_items(select0_html),
+            select0_options,
             preserve_numeric_parens=preserve_numeric_parens,
         )
         used_requests = True
-    elif not select0_html and not select1_html:
+    elif not select0_options and not select1_options:
         stock_items = [] if html_has_soldout_marker(html_text) else ["ONE SIZE:1"]
         used_requests = True
 
