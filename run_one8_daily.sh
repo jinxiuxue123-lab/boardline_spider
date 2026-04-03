@@ -2,7 +2,18 @@
 set -e
 
 PROJECT_ROOT="$(cd "$(dirname "$0")" && pwd)"
-PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+PYTHON_BIN=""
+
+if [ -x "$PROJECT_ROOT/.venv/bin/python" ]; then
+  PYTHON_BIN="$PROJECT_ROOT/.venv/bin/python"
+elif [ -x "$PROJECT_ROOT/venv/bin/python" ]; then
+  PYTHON_BIN="$PROJECT_ROOT/venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+else
+  echo "未找到可用 Python，请先创建虚拟环境或安装 python3"
+  exit 1
+fi
 
 cd "$PROJECT_ROOT"
 export PLAYWRIGHT_HEADLESS="${PLAYWRIGHT_HEADLESS:-1}"

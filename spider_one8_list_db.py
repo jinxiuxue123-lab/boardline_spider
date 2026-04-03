@@ -545,9 +545,11 @@ class One8ListParser(HTMLParser):
         self._current = None
         self._capture_eng_name = False
         self._capture_name = False
+        self._capture_color = False
         self._capture_discount_note = False
         self._eng_name_parts = []
         self._name_parts = []
+        self._color_parts = []
         self._discount_note_parts = []
 
     def handle_starttag(self, tag, attrs):
@@ -574,9 +576,11 @@ class One8ListParser(HTMLParser):
             }
             self._eng_name_parts = []
             self._name_parts = []
+            self._color_parts = []
             self._discount_note_parts = []
             self._capture_eng_name = False
             self._capture_name = False
+            self._capture_color = False
             self._capture_discount_note = False
             return
 
@@ -609,6 +613,9 @@ class One8ListParser(HTMLParser):
         elif tag == "span" and "eng_name" in class_list:
             self._capture_eng_name = True
             self._eng_name_parts = []
+        elif tag == "span" and "color_size" in class_list:
+            self._capture_color = True
+            self._color_parts = []
         elif tag == "div" and "name" in class_list:
             self._capture_name = True
             self._name_parts = []
@@ -631,6 +638,12 @@ class One8ListParser(HTMLParser):
             if text:
                 self._current["name"] = text
             self._eng_name_parts = []
+            return
+
+        if tag == "span" and self._capture_color:
+            self._capture_color = False
+            self._current["color"] = clean_text("".join(self._color_parts))
+            self._color_parts = []
             return
 
         if tag == "div" and self._capture_name:
@@ -665,6 +678,8 @@ class One8ListParser(HTMLParser):
             self._current["text_parts"].append(text)
         if self._capture_eng_name:
             self._eng_name_parts.append(data)
+        if self._capture_color:
+            self._color_parts.append(data)
         if self._capture_name:
             self._name_parts.append(data)
         if self._capture_discount_note:
@@ -736,7 +751,7 @@ def extract_product_from_item(item, cate_no: str):
         "cate_no": cate_no,
         "url": product_url,
         "name": name,
-        "color": "",
+        "color": clean_text(item.get("color") or ""),
         "image_url": image_url,
         "original_price": clean_text(item.get("original_price") or ""),
         "discount_price": clean_text(item.get("discount_price") or ""),
@@ -752,7 +767,6 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
     stop_category = False
     consecutive_sold_out = 0
     session = requests.Session()
-    color_cache: dict[str, str] = {}
 
     while True:
         if remaining_limit is not None and total_count >= remaining_limit:
@@ -802,13 +816,6 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
                 page_skipped += 1
                 continue
             try:
-                if product["url"] not in color_cache:
-                    try:
-                        color_cache[product["url"]] = fetch_product_color(session, product["url"])
-                    except Exception as color_error:
-                        print(f"颜色抓取失败: {product['branduid']} | {color_error}")
-                        color_cache[product["url"]] = ""
-                product["color"] = color_cache.get(product["url"], "")
                 local_image_path = download_image(product["image_url"], product["branduid"])
                 today = datetime.now().strftime("%Y-%m-%d")
                 existing = get_product_by_branduid(SOURCE_NAME, product["branduid"])

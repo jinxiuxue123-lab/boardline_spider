@@ -389,3 +389,15 @@ def mark_inactive_products(days_threshold: int = 3, source: Optional[str] = None
 
     conn.commit()
     conn.close()
+
+
+def delete_product_by_id(product_id: int):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("DELETE FROM change_logs WHERE product_id = ?", (product_id,))
+    cursor.execute("DELETE FROM product_updates WHERE product_id = ?", (product_id,))
+    cursor.execute("DELETE FROM products WHERE id = ?", (product_id,))
+
+    conn.commit()
+    conn.close()

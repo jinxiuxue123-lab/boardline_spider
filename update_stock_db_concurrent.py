@@ -1,6 +1,11 @@
 import asyncio
 import os
+import random
 import re
+import threading
+import time
+from html import unescape
+from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -14,6 +19,7 @@ from db_utils import (
     insert_change_log,
     get_connection,
     update_product_image_info,
+    delete_product_by_id,
 )
 from pricing_rules import calculate_cny_pricing, load_pricing_rules
 from xianyu_open.auto_attributes import apply_auto_attributes_for_product
@@ -22,7 +28,7 @@ PROGRESS_FILE = "stock_db_progress_concurrent.txt"
 FAILED_FILE = "failed_stock_urls.txt"
 
 TEST_LIMIT = None      # 测试时抓 100，正式跑全部时改成 None
-CONCURRENCY = 3      # 先用 3，稳定后再考虑 5
+CONCURRENCY = 1      # 详情页先单线程，优先避免触发 boardline 详情限流
 BATCH_SIZE = 30      # 每批处理多少个商品后写一次进度
 MAX_FAILED_RETRY_ROUNDS = 2
 DEBUG_STOCK = True   # 是否打印库存解析结果
@@ -31,6 +37,20 @@ SOURCE_NAME = "boardline"
 DISCOUNT_RULES = load_discount_rules()
 PRICING_RULES = load_pricing_rules()
 PLAYWRIGHT_HEADLESS = (os.getenv("PLAYWRIGHT_HEADLESS", "1").strip().lower() not in ("0", "false", "no"))
+DETAIL_REQUEST_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+    "Referer": BASE_URL,
+}
+DETAIL_SESSION = requests.Session()
+DETAIL_SESSION.headers.update(DETAIL_REQUEST_HEADERS)
+DETAIL_DEBUG_DIR = Path("logs/boardline_detail_debug")
+DETAIL_REQUEST_MIN_INTERVAL_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_MIN_INTERVAL", "1.2"))
+DETAIL_REQUEST_RETRY_COUNT = int(os.getenv("BOARDLINE_DETAIL_REQUEST_RETRY_COUNT", "3"))
+DETAIL_REQUEST_BACKOFF_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_BACKOFF_SECONDS", "2.5"))
+DETAIL_REQUEST_SLEEP_MIN_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_SLEEP_MIN", "5.0"))
+DETAIL_REQUEST_SLEEP_MAX_SECONDS = float(os.getenv("BOARDLINE_DETAIL_REQUEST_SLEEP_MAX", "7.5"))
+DETAIL_REQUEST_LOCK = threading.Lock()
+DETAIL_LAST_REQUEST_AT = 0.0
 
 
 def clean_name(text):
@@ -156,6 +176,13 @@ def download_image(image_url, branduid):
     except Exception as e:
         print(f"详情图下载失败: {image_url} | {e}")
         return None
+
+
+def decode_boardline_html(response):
+    try:
+        return response.content.decode("euc-kr")
+    except UnicodeDecodeError:
+        return response.content.decode("euc-kr", errors="ignore")
 
 
 def has_valid_local_image(local_image_path):
@@ -289,6 +316,401 @@ def compare_and_log(
 
     if old_stock != (stock or ""):
         insert_change_log(product_id, "stock", old_stock, stock or "")
+
+
+def strip_tags(text):
+    text = re.sub(r"<[^>]+>", " ", text or "", flags=re.S)
+    return " ".join(unescape(text).split()).strip()
+
+
+class FirstClassTextParser(HTMLParser):
+    def __init__(self, target_classes):
+        super().__init__()
+        self.target_classes = set(target_classes)
+        self.capture_depth = 0
+        self.parts = []
+        self.done = False
+
+    def handle_starttag(self, tag, attrs):
+        if self.done:
+            return
+        attrs_dict = dict(attrs)
+        classes = set((attrs_dict.get("class") or "").split())
+        if self.capture_depth > 0:
+            self.capture_depth += 1
+            return
+        if self.target_classes.intersection(classes):
+            self.capture_depth = 1
+
+    def handle_endtag(self, tag):
+        if self.done:
+            return
+        if self.capture_depth > 0:
+            self.capture_depth -= 1
+            if self.capture_depth == 0 and self.parts:
+                self.done = True
+
+    def handle_data(self, data):
+        if self.done:
+            return
+        if self.capture_depth > 0:
+            self.parts.append(data)
+
+
+def extract_first_text_by_class(html_text, class_name):
+    parser = FirstClassTextParser({class_name})
+    parser.feed(html_text or "")
+    return " ".join("".join(parser.parts).split()).strip()
+
+
+def extract_title_text(html_text):
+    parser = FirstClassTextParser({"tit-prd"})
+    parser.feed(html_text or "")
+    return clean_name("".join(parser.parts))
+
+
+def extract_detail_image_url_from_html(html_text):
+    patterns = [
+        r'<img[^>]+class="[^"]*\bdetail_image\b[^"]*"[^>]+src="([^"]+)"',
+        r'<img[^>]+src="([^"]+)"[^>]+class="[^"]*\bdetail_image\b[^"]*"',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, html_text or "", flags=re.I | re.S)
+        if match:
+            src = (match.group(1) or "").strip()
+            if src.startswith("/"):
+                return BASE_URL + src
+            return src
+    return ""
+
+
+def extract_select_html(html_text, select_id):
+    pattern = rf'<select[^>]+id="{re.escape(select_id)}"[^>]*>(.*?)</select>'
+    match = re.search(pattern, html_text or "", flags=re.I | re.S)
+    return match.group(1) if match else ""
+
+
+def parse_attrs(attr_text):
+    attrs = {}
+    for key, value in re.findall(r'([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*"([^"]*)"', attr_text or ""):
+        attrs[key.lower()] = value
+    for key, value in re.findall(r"([A-Za-z_:][-A-Za-z0-9_:.]*)\s*=\s*'([^']*)'", attr_text or ""):
+        attrs[key.lower()] = value
+    return attrs
+
+
+def extract_option_items(select_html):
+    items = []
+    for attr_text, inner_html in re.findall(r"<option([^>]*)>(.*?)</option>", select_html or "", flags=re.I | re.S):
+        attrs = parse_attrs(attr_text)
+        items.append(
+            {
+                "text": strip_tags(inner_html),
+                "value": attrs.get("value", ""),
+                "stock_cnt": attrs.get("stock_cnt", ""),
+            }
+        )
+    return items
+
+
+def parse_stock_single_from_options(options, preserve_numeric_parens=False):
+    valid_options = []
+    for opt in options:
+        text = (opt.get("text") or "").strip()
+        value = (opt.get("value") or "").strip()
+        stock_cnt = opt.get("stock_cnt") or ""
+
+        if is_placeholder_option(text, value):
+            continue
+
+        qty = parse_positive_stock_count(stock_cnt)
+        if qty is None:
+            continue
+
+        text = clean_option_text(text, preserve_numeric_parens=preserve_numeric_parens)
+        valid_options.append((text, str(qty)))
+
+    if len(valid_options) == 1:
+        text, stock_cnt = valid_options[0]
+        if len(text) > 25:
+            return [f"ONE SIZE:{stock_cnt}"]
+
+    return [f"{text}:{stock_cnt}" for text, stock_cnt in valid_options]
+
+
+def parse_stock_from_script_data(html_text, preserve_numeric_parens=False):
+    html_text = html_text or ""
+    stock_map = {}
+    pattern = re.compile(
+        r'["\']option_name["\']\s*:\s*["\']([^"\']+)["\'].*?["\']stock_cnt["\']\s*:\s*["\']?(\d+)["\']?',
+        flags=re.I | re.S,
+    )
+    matches = pattern.findall(html_text)
+    if not matches:
+        return []
+
+    for raw_name, raw_qty in matches:
+        qty = parse_positive_stock_count(raw_qty)
+        if qty is None:
+            continue
+
+        option_name = clean_option_text(raw_name, preserve_numeric_parens=preserve_numeric_parens)
+        if not option_name:
+            continue
+
+        parts = [part.strip() for part in re.split(r"\s*[,/]\s*", option_name) if part.strip()]
+        if len(parts) >= 2:
+            color_name = parts[0]
+            size_name = "/".join(parts[1:])
+            stock_map.setdefault(color_name, []).append(f"{size_name}:{qty}")
+        else:
+            stock_map.setdefault("__single__", []).append(f"{option_name}:{qty}")
+
+    if not stock_map:
+        return []
+
+    if set(stock_map.keys()) == {"__single__"}:
+        return stock_map["__single__"]
+
+    result = []
+    for color_name, sizes in stock_map.items():
+        if color_name == "__single__":
+            result.extend(sizes)
+        else:
+            result.append(f"{color_name}({','.join(sizes)})")
+    return result
+
+
+def html_has_soldout_marker(html_text):
+    lowered = (html_text or "").lower()
+    return any(marker in lowered for marker in ("품절", "sold out", "soldout"))
+
+
+def ensure_product_image_from_url(
+    product_id,
+    branduid,
+    current_image_url,
+    current_local_image_path,
+    detail_image_fetched,
+    detail_image_url,
+):
+    if int(detail_image_fetched or 0) == 1 and has_valid_local_image(current_local_image_path):
+        return current_local_image_path
+
+    final_image_url = (detail_image_url or current_image_url or "").strip()
+    if not final_image_url:
+        return current_local_image_path
+
+    if final_image_url.startswith("/"):
+        final_image_url = BASE_URL + final_image_url
+
+    local_image_path = download_image(final_image_url, branduid)
+    if local_image_path:
+        update_product_image_info(product_id, final_image_url, local_image_path, detail_image_fetched=1)
+        return local_image_path
+
+    if final_image_url != (current_image_url or ""):
+        update_product_image_info(product_id, final_image_url, None, detail_image_fetched=0)
+    return current_local_image_path
+
+
+def save_detail_debug_html(branduid, html_text, reason):
+    try:
+        DETAIL_DEBUG_DIR.mkdir(parents=True, exist_ok=True)
+        safe_reason = re.sub(r"[^A-Za-z0-9_-]+", "_", reason or "unknown").strip("_") or "unknown"
+        debug_path = DETAIL_DEBUG_DIR / f"{branduid}_{safe_reason}.html"
+        if not debug_path.exists():
+            debug_path.write_text(html_text or "", encoding="utf-8")
+            print(f"已保存详情调试HTML: {debug_path}")
+    except Exception as e:
+        print(f"保存详情调试HTML失败: {branduid} | {e}")
+
+
+def summarize_script_signals(html_text):
+    signals = []
+    lowered = (html_text or "").lower()
+    for keyword in (
+        "stock_cnt",
+        "mk_p_s_0",
+        "mk_p_s_1",
+        "option",
+        "var ",
+        "function",
+    ):
+        if keyword in lowered:
+            signals.append(keyword)
+    return ",".join(signals)
+
+
+def is_detail_rate_limited(html_text):
+    lowered = (html_text or "").lower()
+    markers = [
+        "초단위로 페이지를 너무 많이 요청",
+        "서버보호차원에서 차단",
+        "특정ip",
+        "로봇에 의한 페이지수집",
+    ]
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def is_product_not_found_page(html_text):
+    lowered = (html_text or "").lower()
+    markers = [
+        "존재하지 않는 상품입니다",
+        "존재하지않는 상품입니다",
+    ]
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def throttle_detail_request():
+    global DETAIL_LAST_REQUEST_AT
+    with DETAIL_REQUEST_LOCK:
+        random_sleep = random.uniform(DETAIL_REQUEST_SLEEP_MIN_SECONDS, DETAIL_REQUEST_SLEEP_MAX_SECONDS)
+        time.sleep(random_sleep)
+        now = time.monotonic()
+        wait_seconds = DETAIL_REQUEST_MIN_INTERVAL_SECONDS - (now - DETAIL_LAST_REQUEST_AT)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+        DETAIL_LAST_REQUEST_AT = time.monotonic()
+
+
+def fetch_detail_html_with_retry(url, branduid):
+    last_html = ""
+    last_error = None
+    for attempt in range(1, DETAIL_REQUEST_RETRY_COUNT + 1):
+        throttle_detail_request()
+        try:
+            response = DETAIL_SESSION.get(url, timeout=20)
+            response.raise_for_status()
+            html_text = decode_boardline_html(response)
+            last_html = html_text
+            if is_product_not_found_page(html_text):
+                raise RuntimeError("product_not_found")
+            if not is_detail_rate_limited(html_text):
+                return html_text
+
+            print(f"详情页请求被限流，等待后重试: {branduid} | {attempt}/{DETAIL_REQUEST_RETRY_COUNT}")
+            last_error = RuntimeError("detail_rate_limited")
+        except Exception as e:
+            last_error = e
+
+        if attempt < DETAIL_REQUEST_RETRY_COUNT:
+            sleep_seconds = DETAIL_REQUEST_BACKOFF_SECONDS * attempt
+            time.sleep(sleep_seconds)
+
+    if last_html and is_detail_rate_limited(last_html):
+        save_detail_debug_html(branduid, last_html, "rate_limited")
+        raise RuntimeError("detail_rate_limited")
+
+    if last_html and is_product_not_found_page(last_html):
+        save_detail_debug_html(branduid, last_html, "product_not_found")
+        raise RuntimeError("product_not_found")
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("detail_request_failed")
+
+
+def fetch_detail_via_requests_sync(product_tuple):
+    product_id, branduid, name, url, category, image_url, local_image_path, detail_image_fetched = product_tuple
+
+    html_text = fetch_detail_html_with_retry(url, branduid)
+
+    title = extract_title_text(html_text)
+    resolved_name = clean_name(title) if title else (name or "")
+
+    price = extract_first_text_by_class(html_text, "price")
+    original_price = extract_first_text_by_class(html_text, "consumer")
+    detail_image_url = extract_detail_image_url_from_html(html_text)
+
+    if not price and not original_price:
+        save_detail_debug_html(branduid, html_text, "missing_price")
+        return {
+            "ok": False,
+            "fallback": True,
+            "reason": f"静态价格未解析到|signals={summarize_script_signals(html_text)}",
+        }
+
+    preserve_numeric_parens = "滑雪鞋" in (category or "")
+    select0_html = extract_select_html(html_text, "MK_p_s_0")
+    select1_html = extract_select_html(html_text, "MK_p_s_1")
+    script_stock_items = parse_stock_from_script_data(
+        html_text,
+        preserve_numeric_parens=preserve_numeric_parens,
+    )
+
+    stock_items = []
+    used_requests = False
+    if "滑雪板" in (category or ""):
+        stock_items = parse_stock_single_from_options(
+            extract_option_items(select0_html),
+            preserve_numeric_parens=preserve_numeric_parens,
+        )
+        used_requests = True
+    elif script_stock_items:
+        stock_items = script_stock_items
+        used_requests = True
+    elif select0_html and not select1_html:
+        stock_items = parse_stock_single_from_options(
+            extract_option_items(select0_html),
+            preserve_numeric_parens=preserve_numeric_parens,
+        )
+        used_requests = True
+    elif not select0_html and not select1_html:
+        stock_items = [] if html_has_soldout_marker(html_text) else ["ONE SIZE:1"]
+        used_requests = True
+
+    if not used_requests:
+        save_detail_debug_html(branduid, html_text, "dynamic_options")
+        return {
+            "ok": False,
+            "fallback": True,
+            "reason": f"需要动态解析联动库存|signals={summarize_script_signals(html_text)}",
+        }
+
+    local_image_path = ensure_product_image_from_url(
+        product_id,
+        branduid,
+        image_url,
+        local_image_path,
+        detail_image_fetched,
+        detail_image_url,
+    )
+
+    stock = " | ".join(stock_items)
+    latest_discount_price = calculate_latest_discount_price(
+        original_price,
+        resolved_name,
+        category,
+        DISCOUNT_RULES,
+    )
+    cny_pricing = calculate_cny_pricing(
+        category,
+        price,
+        original_price,
+        latest_discount_price,
+        PRICING_RULES,
+    )
+
+    return {
+        "ok": True,
+        "used_requests": True,
+        "product_id": product_id,
+        "branduid": branduid,
+        "category": category,
+        "url": url,
+        "name": resolved_name,
+        "price": price,
+        "original_price": original_price,
+        "latest_discount_price": latest_discount_price,
+        "price_cny": cny_pricing["price_cny"],
+        "original_price_cny": cny_pricing["original_price_cny"],
+        "shipping_fee_cny": cny_pricing["shipping_fee_cny"],
+        "final_price_cny": cny_pricing["final_price_cny"],
+        "exchange_rate": cny_pricing["exchange_rate"],
+        "profit_rate": cny_pricing["profit_rate"],
+        "stock": stock,
+    }
 
 
 async def parse_stock_single(page, preserve_numeric_parens=False):
@@ -509,9 +931,40 @@ async def fetch_one(browser, product_tuple, sem, idx, total):
     product_id, branduid, name, url, category, image_url, local_image_path, detail_image_fetched = product_tuple
 
     async with sem:
-        page = await browser.new_page()
         try:
             print(f"更新 {idx}/{total}: {branduid} [{category}]")
+
+            try:
+                request_result = await asyncio.to_thread(fetch_detail_via_requests_sync, product_tuple)
+            except Exception as request_error:
+                reason = str(request_error)
+                if "product_not_found" in reason:
+                    return {
+                        "ok": False,
+                        "skip_delete": True,
+                        "product_id": product_id,
+                        "branduid": branduid,
+                        "category": category,
+                        "url": url,
+                        "error": "商品不存在，已从数据库删除",
+                    }
+                if "detail_rate_limited" in reason:
+                    reason = "详情页requests被限流"
+                request_result = {
+                    "ok": False,
+                    "fallback": True,
+                    "reason": f"requests解析失败: {reason}",
+                }
+
+            if request_result.get("ok"):
+                apply_auto_attributes_for_product(product_id, category, name, request_result["stock"])
+                log_detail_result(request_result, "requests")
+                return request_result
+
+            if DEBUG_STOCK:
+                print(f"回退浏览器 -> {branduid} | {category} | {request_result.get('reason', 'unknown')}")
+
+            page = await browser.new_page()
 
             await page.goto(url, timeout=60000)
             await page.wait_for_selector("h3.cboth.tit-prd", timeout=10000)
@@ -550,8 +1003,15 @@ async def fetch_one(browser, product_tuple, sem, idx, total):
 
             apply_auto_attributes_for_product(product_id, category, name, stock)
 
-            if DEBUG_STOCK:
-                print(f"库存结果 -> {branduid} | {category} | {stock}")
+            log_detail_result(
+                {
+                    "branduid": branduid,
+                    "price": price,
+                    "original_price": original_price,
+                    "stock": stock,
+                },
+                "playwright",
+            )
 
             return {
                 "ok": True,
@@ -582,7 +1042,8 @@ async def fetch_one(browser, product_tuple, sem, idx, total):
             }
 
         finally:
-            await page.close()
+            if "page" in locals():
+                await page.close()
 
 
 async def process_batch(browser, batch_products, sem, start_no, total):
@@ -632,6 +1093,22 @@ def handle_success_result(result):
     )
 
 
+def handle_deleted_result(result):
+    delete_product_by_id(result["product_id"])
+    print(f"商品不存在，已删除: SKU={result['branduid']} | 分类={result['category']}")
+
+
+def log_detail_result(result, method):
+    print(
+        "详情结果 -> "
+        f"SKU={result['branduid']} | "
+        f"方式={method} | "
+        f"价格={result['price'] or '-'} | "
+        f"原价={result['original_price'] or '-'} | "
+        f"库存={result['stock'] or '-'}"
+    )
+
+
 async def main():
     if os.path.exists(FAILED_FILE):
         os.remove(FAILED_FILE)
@@ -678,6 +1155,8 @@ async def main():
                 if result["ok"]:
                     handle_success_result(result)
                     success_count += 1
+                elif result.get("skip_delete"):
+                    handle_deleted_result(result)
                 else:
                     print("失败:", result["url"])
                     print(result["error"])
@@ -704,6 +1183,8 @@ async def main():
                     if result["ok"]:
                         handle_success_result(result)
                         success_count += 1
+                    elif result.get("skip_delete"):
+                        handle_deleted_result(result)
                     else:
                         print("重试仍失败:", result["url"])
                         print(result["error"])
