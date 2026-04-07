@@ -3168,27 +3168,33 @@ class AdminHandler(BaseHTTPRequestHandler):
                 f"<button type='button' class='mini-btn danger-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick='publishProductToTaobao(this)'>淘宝发布助手</button>"
             )
 
-        option_rows = "".join(
-            f"<tr class='{'group-row' if int(row.get('merged_group') or 0) == 1 else ('group-member-row' if int(row.get('group_member_row') or 0) == 1 else '')}' data-parent-group-id='{int(row.get('parent_group_id') or 0)}' data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name'])]))}' {'onclick=\"toggleGroupMembers(' + str(int(row.get('merged_group_id') or 0)) + ')\"' if int(row.get('merged_group') or 0) == 1 else ''}>"
-            f"<td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{html.escape(str(row.get('merged_product_ids') or int(row['product_id'])))}' data-group-id='{int(row.get('merged_group_id') or 0)}' data-is-group='{'1' if int(row.get('merged_group') or 0) == 1 else '0'}' data-ai-channel='taobao' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if row_has_display_ai_images(row, shop_account_name, 'taobao') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td>"
-            f"<td>{product_origin_image_cell(str(row.get('image_url') or ''))}</td>"
-            f"<td>{product_ai_main_image_cell_for_row(row, shop_account_name, 'taobao')}</td>"
-            f"<td>{product_ai_detail_cell(int(row['product_id']), str(row.get('ai_detail_images_json') or '[]'), shop_account_name)}</td>"
-            f"<td>{int(row['product_id'])}</td>"
-            f"<td>{html.escape(str(row.get('source') or ''))}</td>"
-            f"<td>{derive_taobao_inventory_tag(str(row.get('source') or ''))}</td>"
-            f"<td>{html.escape(str(row['category']))}</td>"
-            f"<td>{product_name_cell(row)}</td>"
-            f"<td>{html.escape(display_beijing_time(row.get('first_seen')))}</td>"
-            f"<td>{html.escape(str(row['final_price_cny'] or ''))}</td>"
-            f"<td>{html.escape(str(row['stock'] or ''))}</td>"
-            f"<td>{int(row.get('hot_index') or 0)}</td>"
-            f"<td>{copy_preview_cell(row)}</td>"
-            f"<td>{group_copy_cell(row)}</td>"
-            f"<td>{row_action_cell(row)}</td>"
-            f"</tr>"
-            for _, row in paged_pool.iterrows()
-        )
+        option_row_parts = []
+        for _, row in paged_pool.iterrows():
+            is_group = int(row.get("merged_group") or 0) == 1
+            is_member = int(row.get("group_member_row") or 0) == 1
+            row_class = "group-row" if is_group else ("group-member-row" if is_member else "")
+            row_click_attr = f'onclick="toggleGroupMembers({int(row.get("merged_group_id") or 0)})"' if is_group else ""
+            option_row_parts.append(
+                f"<tr class='{row_class}' data-parent-group-id='{int(row.get('parent_group_id') or 0)}' data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name'])]))}' {row_click_attr}>"
+                f"<td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{html.escape(str(row.get('merged_product_ids') or int(row['product_id'])))}' data-group-id='{int(row.get('merged_group_id') or 0)}' data-is-group='{'1' if is_group else '0'}' data-ai-channel='taobao' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if row_has_display_ai_images(row, shop_account_name, 'taobao') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td>"
+                f"<td>{product_origin_image_cell(str(row.get('image_url') or ''))}</td>"
+                f"<td>{product_ai_main_image_cell_for_row(row, shop_account_name, 'taobao')}</td>"
+                f"<td>{product_ai_detail_cell(int(row['product_id']), str(row.get('ai_detail_images_json') or '[]'), shop_account_name)}</td>"
+                f"<td>{int(row['product_id'])}</td>"
+                f"<td>{html.escape(str(row.get('source') or ''))}</td>"
+                f"<td>{derive_taobao_inventory_tag(str(row.get('source') or ''))}</td>"
+                f"<td>{html.escape(str(row['category']))}</td>"
+                f"<td>{product_name_cell(row)}</td>"
+                f"<td>{html.escape(display_beijing_time(row.get('first_seen')))}</td>"
+                f"<td>{html.escape(str(row['final_price_cny'] or ''))}</td>"
+                f"<td>{html.escape(str(row['stock'] or ''))}</td>"
+                f"<td>{int(row.get('hot_index') or 0)}</td>"
+                f"<td>{copy_preview_cell(row)}</td>"
+                f"<td>{group_copy_cell(row)}</td>"
+                f"<td>{row_action_cell(row)}</td>"
+                f"</tr>"
+            )
+        option_rows = "".join(option_row_parts)
         category_buttons = "".join(
             f"<a class='{'active' if cat == category else ''}' href='{html.escape(build_url('/taobao/shop', id=int(shop['id']), category=cat, ai_image_filter=ai_image_filter, show=show_mode))}'>{html.escape(cat)}</a>"
             for cat in categories
@@ -3472,10 +3478,32 @@ class AdminHandler(BaseHTTPRequestHandler):
                 f"<tr><td class='select-cell' onclick='toggleRowCheckbox(this)'>{checkbox}</td><td>{int(row['task_id'])}</td><td>{image_cell(str(row.get('image_url') or ''))}</td><td><a href='/batch?id={batch_id}'>{batch_id}</a></td><td>{html.escape(str(row['batch_name']))}</td><td>{html.escape(str(row['category']))}</td><td>{html.escape(str(row['name']))}</td><td>{copy_preview_cell(row)}</td><td>{html.escape(str(row['status']))}</td><td>{html.escape(str(row['publish_status'] or ''))}</td><td>{html.escape(str(row['callback_status'] or ''))}</td><td>{html.escape(str(row['err_msg'] or ''))}</td><td>{self.task_action_cell(row)}</td></tr>"
             )
         task_rows = "".join(task_row_parts)
-        option_rows = "".join(
-            f"<tr class='{'group-row' if int(row.get('merged_group') or 0) == 1 else ('group-member-row' if int(row.get('group_member_row') or 0) == 1 else '')}' data-parent-group-id='{int(row.get('parent_group_id') or 0)}' data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name']), str(row.get('merged_color_summary') or '')]))}' {'onclick=\"toggleGroupMembers(' + str(int(row.get('merged_group_id') or 0)) + ')\"' if int(row.get('merged_group') or 0) == 1 else ''}><td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{html.escape(str(row.get('merged_product_ids') or int(row['product_id'])))}' data-group-id='{int(row.get('merged_group_id') or 0)}' data-is-group='{'1' if int(row.get('merged_group') or 0) == 1 else '0'}' data-ai-channel='xianyu' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if row_has_display_ai_images(row, account_name, 'xianyu') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td><td>{product_image_gallery_cell_for_row(row, account_name, 'xianyu')}</td><td>{int(row['product_id'])}</td><td>{html.escape(str(row['category']))}</td><td>{product_name_cell(row)}</td><td>{html.escape(display_beijing_time(row.get('first_seen')))}</td><td>{html.escape(str(row['final_price_cny'] or ''))}</td><td>{html.escape(str(row['stock'] or ''))}</td><td>{int(row.get('hot_index') or 0)}</td><td>{copy_preview_cell(row)}</td><td>{group_copy_cell(row)}</td><td>{row_action_cell(row)}</td><td>{html.escape(str(row.get('display_status') or ''))}</td><td>{html.escape(str(row.get('latest_status') or ''))}</td><td>{int(row.get('upload_count') or 0)}</td></tr>"
-            for _, row in paged_pool.iterrows()
-        )
+        option_row_parts = []
+        for _, row in paged_pool.iterrows():
+            is_group = int(row.get("merged_group") or 0) == 1
+            is_member = int(row.get("group_member_row") or 0) == 1
+            row_class = "group-row" if is_group else ("group-member-row" if is_member else "")
+            row_click_attr = f'onclick="toggleGroupMembers({int(row.get("merged_group_id") or 0)})"' if is_group else ""
+            option_row_parts.append(
+                f"<tr class='{row_class}' data-parent-group-id='{int(row.get('parent_group_id') or 0)}' data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name']), str(row.get('merged_color_summary') or '')]))}' {row_click_attr}>"
+                f"<td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{html.escape(str(row.get('merged_product_ids') or int(row['product_id'])))}' data-group-id='{int(row.get('merged_group_id') or 0)}' data-is-group='{'1' if is_group else '0'}' data-ai-channel='xianyu' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if row_has_display_ai_images(row, account_name, 'xianyu') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td>"
+                f"<td>{product_image_gallery_cell_for_row(row, account_name, 'xianyu')}</td>"
+                f"<td>{int(row['product_id'])}</td>"
+                f"<td>{html.escape(str(row['category']))}</td>"
+                f"<td>{product_name_cell(row)}</td>"
+                f"<td>{html.escape(display_beijing_time(row.get('first_seen')))}</td>"
+                f"<td>{html.escape(str(row['final_price_cny'] or ''))}</td>"
+                f"<td>{html.escape(str(row['stock'] or ''))}</td>"
+                f"<td>{int(row.get('hot_index') or 0)}</td>"
+                f"<td>{copy_preview_cell(row)}</td>"
+                f"<td>{group_copy_cell(row)}</td>"
+                f"<td>{row_action_cell(row)}</td>"
+                f"<td>{html.escape(str(row.get('display_status') or ''))}</td>"
+                f"<td>{html.escape(str(row.get('latest_status') or ''))}</td>"
+                f"<td>{int(row.get('upload_count') or 0)}</td>"
+                f"</tr>"
+            )
+        option_rows = "".join(option_row_parts)
         category_buttons = "".join(
             f"<a class='{'active' if cat == category else ''}' href='{html.escape(build_url('/account', name=account_name, category=cat, upload_status_filter=upload_status_filter, ai_image_filter=ai_image_filter, show=show_mode))}'>{html.escape(cat)}</a>"
             for cat in categories
