@@ -1036,7 +1036,8 @@ def build_watermarked_upload_variant(local_image_path: str, account_name: str) -
     source_hash = hashlib.md5(str(source_path.resolve()).encode("utf-8")).hexdigest()[:6]
     account_hash = hashlib.md5(account_name.encode("utf-8")).hexdigest()[:4]
     time_token = format(int(stat.st_mtime_ns), "x")[-5:]
-    out_name = f"w{source_hash}{account_hash}{time_token}.jpg"
+    watermark_version = "v2"
+    out_name = f"w{watermark_version}_{source_hash}{account_hash}{time_token}.jpg"
     UPLOAD_VARIANT_DIR.mkdir(parents=True, exist_ok=True)
     out_path = UPLOAD_VARIANT_DIR / out_name
     if out_path.exists():
