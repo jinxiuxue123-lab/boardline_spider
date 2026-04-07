@@ -936,12 +936,19 @@ def add_account_watermark(image_bytes: bytes, account_name: str) -> bytes:
     overlay = Image.new("RGBA", base_image.size, (255, 255, 255, 0))
     wm_w, wm_h = 234, 67
 
-    # 更稳的中文字体候选，优先苹方，其次黑体/冬青黑体
+    # 中文字体候选，兼容本地 macOS 和服务器 Linux 环境
     font_candidates = [
         "/System/Library/Fonts/PingFang.ttc",
         "/System/Library/Fonts/Hiragino Sans GB.ttc",
         "/System/Library/Fonts/STHeiti Medium.ttc",
         "/System/Library/Fonts/Supplemental/Songti.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+        "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+        "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+        "/usr/share/fonts/truetype/arphic/uming.ttc",
+        "/usr/share/fonts/truetype/arphic/ukai.ttc",
     ]
 
     def load_font(size: int):
