@@ -30,5 +30,13 @@ failed_list_pages.txt
 tmp_*.json
 boardline_spider_deploy.tar.gz
 
+# generated outputs
+all_products_stock.xlsx
+one8_products.xlsx
+failed_stock_urls.txt
+stock_changes_*.xlsx
+products.db.batch*_backup_*.sqlite
+web/catalog-data.js
+
 # local secrets
 scripts/*env.sh

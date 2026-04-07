@@ -1289,6 +1289,42 @@ def page_html(title: str, body: str) -> str:
         showResultModal("刷新状态失败", `刷新状态失败\\n${{error && error.message ? error.message : error}}`);
       }}
     }}
+    async function refreshAccountStatus(button) {{
+      const accountName = button.dataset.accountName || "";
+      if (!accountName) {{
+        alert("缺少账号名称");
+        return;
+      }}
+      if (button.dataset.loading === "1") {{
+        return;
+      }}
+      button.dataset.loading = "1";
+      button.disabled = true;
+      const originalText = button.textContent;
+      button.textContent = "校验中...";
+      showProgressMask(`正在校验账号 ${{accountName}} 的上架状态，请不要关闭页面。`);
+      try {{
+        const resp = await fetch("/account/refresh-status", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+          body: new URLSearchParams({{ account_name: accountName }}).toString(),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.ok === false) {{
+          throw new Error(data.message || "校验上架状态失败");
+        }}
+        hideProgressMask("上架状态已校验");
+        showResultModal("校验上架状态完成", data.message || "校验完成");
+        window.location.reload();
+      }} catch (error) {{
+        hideProgressMask("校验上架状态失败");
+        showResultModal("校验上架状态失败", `校验上架状态失败\\n${{error && error.message ? error.message : error}}`);
+      }} finally {{
+        button.dataset.loading = "0";
+        button.disabled = false;
+        button.textContent = originalText;
+      }}
+    }}
     async function rebuildBatchWithPng(button) {{
       const batchId = button.dataset.batchId || "";
       if (!batchId) {{
@@ -2815,6 +2851,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return self.execute_batch_ajax()
             if parsed.path == "/batch/refresh-status":
                 return self.refresh_batch_status()
+            if parsed.path == "/account/refresh-status":
+                return self.refresh_account_status()
             if parsed.path == "/batch/rebuild-with-png":
                 return self.rebuild_batch_with_png()
             if parsed.path == "/batch/generate-ai":
@@ -2913,7 +2951,7 @@ class AdminHandler(BaseHTTPRequestHandler):
     def render_accounts(self):
         summary = load_account_summary()
         rows = "".join(
-            f"<tr><td><a href='{html.escape(build_url('/account', name=row['account_name']))}'>{html.escape(str(row['account_name']))}</a></td><td>{int(row['task_count'] or 0)}</td><td>{int(row['uploaded_count'] or 0)}</td><td>{int(row['published_count'] or 0)}</td><td>{int(row['failed_count'] or 0)}</td><td>{int(row['pending_count'] or 0)}</td></tr>"
+            f"<tr><td><a href='{html.escape(build_url('/account', name=row['account_name']))}'>{html.escape(str(row['account_name']))}</a></td><td>{int(row['task_count'] or 0)}</td><td>{int(row['uploaded_count'] or 0)}</td><td>{int(row['published_count'] or 0)}</td><td>{int(row['failed_count'] or 0)}</td><td>{int(row['pending_count'] or 0)}</td><td><button type='button' class='mini-btn ghost-btn' data-account-name='{html.escape(str(row['account_name']))}' onclick='refreshAccountStatus(this)'>校验上架状态</button></td></tr>"
             for _, row in summary.iterrows()
         )
         self.send_html(
@@ -2923,7 +2961,7 @@ class AdminHandler(BaseHTTPRequestHandler):
               <h1>账号概览</h1>
               <div class='table-wrap'>
                 <table>
-                  <tr><th>账号</th><th>任务数</th><th>已上传</th><th>已确认上架</th><th>失败</th><th>待处理</th></tr>
+                  <tr><th>账号</th><th>任务数</th><th>已上传</th><th>已确认上架</th><th>失败</th><th>待处理</th><th>操作</th></tr>
                   {rows}
                 </table>
               </div>
@@ -2954,6 +2992,67 @@ class AdminHandler(BaseHTTPRequestHandler):
               </form>
             </div>
             """,
+        )
+
+    def refresh_account_status(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        form = parse_qs(self.rfile.read(length).decode("utf-8"))
+        account_name = (form.get("account_name") or [""])[0].strip()
+        if not account_name:
+            return self.send_json({"ok": False, "message": "缺少账号名称"}, 400)
+
+        conn = get_conn()
+        rows = conn.execute(
+            """
+            SELECT
+                t.id,
+                COALESCE(t.batch_id, 0) AS batch_id
+            FROM xianyu_publish_tasks t
+            JOIN xianyu_accounts a
+              ON a.id = t.account_id
+            WHERE a.account_name = ?
+              AND (
+                COALESCE(t.third_product_id, '') != ''
+                OR t.status IN ('created', 'submitted', 'published')
+                OR COALESCE(t.publish_status, '') IN ('created', 'submitted', 'published')
+              )
+            ORDER BY COALESCE(t.batch_id, 0), t.id
+            """,
+            (account_name,),
+        ).fetchall()
+        conn.close()
+
+        task_ids_by_batch: dict[int, list[int]] = {}
+        for row in rows:
+            batch_id = int(row["batch_id"] or 0)
+            task_ids_by_batch.setdefault(batch_id, []).append(int(row["id"]))
+
+        matched_count = 0
+        checked_count = sum(len(task_ids) for task_ids in task_ids_by_batch.values())
+        for batch_id, task_ids in task_ids_by_batch.items():
+            reconciled = reconcile_remote_created_tasks(batch_id, task_ids, use_batch_window=batch_id > 0)
+            matched_count += int(reconciled.get("matched_count") or 0)
+
+        refreshed = load_account_summary(account_name)
+        uploaded_count = 0
+        published_count = 0
+        if not refreshed.empty:
+            row = refreshed.iloc[0]
+            uploaded_count = int(row["uploaded_count"] or 0)
+            published_count = int(row["published_count"] or 0)
+
+        return self.send_json(
+            {
+                "ok": True,
+                "checked_count": checked_count,
+                "matched_count": matched_count,
+                "uploaded_count": uploaded_count,
+                "published_count": published_count,
+                "message": (
+                    f"账号 {account_name} 校验完成：检查 {checked_count} 条任务，"
+                    f"同步 {matched_count} 条远端状态，已上传 {uploaded_count}，已确认上架 {published_count}"
+                ),
+            }
         )
 
     def render_taobao_shops(self):
@@ -3373,21 +3472,32 @@ class AdminHandler(BaseHTTPRequestHandler):
 
         tasks = load_task_details(account_name)
         product_pool = load_account_product_pool(account_name)
-        if category != "全部":
-            tasks = tasks[tasks["category"] == category]
-            product_pool = product_pool[product_pool["category"] == category]
         product_pool = merge_one8_product_groups(product_pool)
 
         def upload_status_label(row):
             latest_status = str(row.get("latest_status") or "")
+            if latest_status in ("published", "success"):
+                return "已确认上架"
+            return "未确认上架"
+
+        def matches_upload_status_filter(row, selected_filter: str) -> bool:
+            latest_status = str(row.get("latest_status") or "")
             upload_count = int(row.get("upload_count") or 0)
-            if latest_status in ("off_shelved", "off_shelf_failed"):
-                return "已下架"
-            if latest_status in ("failed", "publish_failed"):
-                return "失败"
-            if upload_count > 0:
-                return "已上传"
-            return "未上传"
+            if selected_filter == "全部":
+                return True
+            if selected_filter == "已上传":
+                return upload_count > 0
+            if selected_filter == "已确认上架":
+                return latest_status in ("published", "success")
+            if selected_filter == "未确认上架":
+                return latest_status not in ("published", "success")
+            if selected_filter == "失败":
+                return latest_status in ("failed", "publish_failed")
+            if selected_filter == "已下架":
+                return latest_status in ("off_shelved", "off_shelf_failed")
+            if selected_filter == "未上传":
+                return upload_count <= 0
+            return str(row.get("display_status") or "") == selected_filter
 
         if not product_pool.empty:
             product_pool = product_pool.copy()
@@ -3397,15 +3507,19 @@ class AdminHandler(BaseHTTPRequestHandler):
                 axis=1,
             )
             if upload_status_filter != "全部":
-                product_pool = product_pool[product_pool["display_status"] == upload_status_filter]
+                product_pool = product_pool[product_pool.apply(lambda row: matches_upload_status_filter(row, upload_status_filter), axis=1)]
             if ai_image_filter != "全部":
                 product_pool = product_pool[product_pool["ai_image_status"] == ai_image_filter]
         else:
             product_pool["display_status"] = []
             product_pool["ai_image_status"] = []
 
-        categories = ["全部"] + sorted(set(tasks["category"].dropna().tolist()) | set(product_pool["category"].dropna().tolist()))
-        upload_status_filters = ["全部", "未上传", "已上传", "失败", "已下架"]
+        filtered_pool_categories = set(product_pool["category"].dropna().tolist()) if not product_pool.empty else set()
+        categories = ["全部"] + sorted(filtered_pool_categories)
+        if category != "全部":
+            tasks = tasks[tasks["category"] == category]
+            product_pool = product_pool[product_pool["category"] == category]
+        upload_status_filters = ["全部", "未上传", "已上传", "已确认上架", "未确认上架", "失败", "已下架"]
         ai_image_filters = ["全部", "已生成AI图", "未生成AI图"]
         paged_pool, total_products, total_pages, page = paginate_df(product_pool, page, show_all=show_all)
         today = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
