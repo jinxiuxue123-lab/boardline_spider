@@ -310,6 +310,15 @@ def build_public_image_url(local_path: Path) -> str:
     return f"{public_base}/media/local?{query}"
 
 
+def build_public_image_urls(local_paths: list[Path]) -> list[str]:
+    urls = []
+    for path in local_paths:
+        if not path:
+            continue
+        urls.append(build_public_image_url(path))
+    return urls
+
+
 def sample_background_color(image: Image.Image) -> tuple[int, int, int, int]:
     rgba = image.convert("RGBA")
     width, height = rgba.size
@@ -610,6 +619,7 @@ def _build_taobao_detail_image_prompt(name: str, category: str, ai_title: str) -
 def build_image_prompt(product: dict, variant_index: int = 0, asset_type: str = "main", channel: str = "xianyu") -> str:
     name = str(product.get("name") or "").strip()
     category = str(product.get("category") or "").strip()
+    color = str(product.get("color") or "").strip()
     account_name = str(product.get("account_name") or "").strip()
     channel = normalize_image_channel(channel or product.get("image_channel") or "")
     ai_title = str(product.get("ai_title") or "").strip()
@@ -644,6 +654,9 @@ def build_image_prompt(product: dict, variant_index: int = 0, asset_type: str = 
 
 商品分类：
 {category or "未分类"}
+
+商品颜色/配色：
+{color or "未提供，请以原图实际配色为准并严格保持"}
 
 核心任务：
 1. 保留商品本体的真实结构、比例、Logo、颜色、材质、纹理和细节。
@@ -783,6 +796,11 @@ def build_image_prompt(product: dict, variant_index: int = 0, asset_type: str = 
 保留商品原有外观、结构、Logo、颜色、绑带、金属件、镜片、纹理和材质细节，不改变产品比例、形态和核心设计。
 在此基础上，将背景替换为高级感雪山雪场环境，增强单板滑雪氛围，使图片更适合电商平台展示。
 
+颜色锁定要求：
+1. 如果当前商品存在明确颜色/配色信息，必须严格保持该颜色版本，不允许改成其它颜色。
+2. 即使同款存在其它颜色，也不能混入其它颜色版本的配色元素。
+3. 如果原图与标题中的颜色信息存在轻微差异，以原图可见主体颜色为最高优先级，但绝不能偏离当前颜色版本。
+
 画面要求：
 1. 最终画面必须直接输出为 1:1 正方形电商主图构图，画面内容自然铺满整个画布，不要出现大块留白、补底色、空边或后期裁切感。
 2. 商品主体必须居中展示，占据主要视觉区域，是画面唯一视觉核心，但主体尺寸必须明显克制，不能做成怼满画面的构图。主体整体建议只占最终画面的约 38% 到 48%。
@@ -824,6 +842,87 @@ E-commerce photo of the product, centered. Approximately 15% of clean margin mus
 
 输出单张图片即可。
 """.strip()
+
+
+def build_group_cover_prompt(group_name: str, category: str, colors: list[str], channel: str = "xianyu") -> str:
+    color_text = " / ".join([str(color or "").strip() for color in colors if str(color or "").strip()])
+    channel = normalize_image_channel(channel)
+    base = f"""
+你是一名电商主图设计助手。请基于输入图片，生成一张“同款多色”的电商组商品主图。
+
+商品名称：
+{group_name}
+
+商品分类：
+{category or "未分类"}
+
+颜色列表：
+{color_text or "以输入图中的颜色版本为准"}
+
+核心要求：
+1. 输入图中已经包含同款多个颜色版本，必须完整保留这些颜色版本，不允许删掉、替换、增减或改色。
+2. 输出必须是 1:1 正方形电商主图，画面更统一、更高级，但仍然一眼能看出这是同款多色商品。
+3. 不要只做机械拼贴感排版，要让整体更像专业电商海报主图；但也不能把多个颜色融合成一个商品。
+4. 每个颜色版本都必须清楚可见，颜色真实，结构、Logo、材质和细节保真。
+5. 不允许改变任一成员商品的主颜色，不允许把一个颜色版本生成成另一个颜色版本。
+6. 不要添加人物、文字、水印、品牌贴纸、夸张特效。
+7. 背景可以更统一、更有设计感，但主体仍然必须是这些商品本身。
+8. 输出的是“多色组合主图”，不是单个商品主图。
+"""
+    if channel == "taobao":
+        base += "\n9. 画面更偏淘宝商品主图风格，干净、明确、适合商品卡展示。"
+    else:
+        base += "\n9. 画面更偏闲鱼电商主图风格，真实、清楚、兼顾转化感。"
+    return base.strip()
+
+
+def generate_group_ai_cover_image(
+    *,
+    source: str,
+    group_id: int,
+    group_name: str,
+    category: str,
+    items: list[dict],
+    account_name: str = "",
+    channel: str = "xianyu",
+    output_name: str = "ai_cover.jpg",
+) -> str:
+    provider = get_image_provider()
+    if provider not in ("nanobanana", "n1n", "n1n_nanobanana", "gemini_image", "openai", "openai_image", "openai_compatible", "flux", "flux_edit"):
+        raise ValueError(f"暂不支持的图片生成 provider: {provider}")
+
+    image_paths: list[Path] = []
+    for item in items:
+        image_path = str(item.get("ai_image_path") or item.get("local_image_path") or "").strip()
+        if not image_path:
+            continue
+        path_obj = Path(image_path)
+        if path_obj.exists():
+            image_paths.append(path_obj)
+    if not image_paths:
+        raise ValueError("组商品缺少可用成员图片")
+
+    prompt_text = build_group_cover_prompt(
+        group_name=group_name,
+        category=category,
+        colors=[str(item.get("color") or "").strip() for item in items],
+        channel=channel,
+    )
+    model_name = get_image_model().strip().lower()
+    if provider in ("openai", "openai_image", "openai_compatible", "flux", "flux_edit") or model_name.startswith("gpt-image") or model_name.startswith("flux"):
+        image_bytes = call_openai_compatible_image(image_paths, prompt_text)
+    elif model_name.startswith("fal-ai/"):
+        image_bytes = call_nanobanana_image(image_paths, prompt_text)
+    elif model_name.startswith("gemini-"):
+        image_bytes = call_gemini_image_via_n1n(image_paths, prompt_text, account_name=account_name)
+    else:
+        raise ValueError(f"暂不支持的图片模型路由: {get_image_model()}")
+
+    output_dir = DATA_DIR / "group_assets" / source / f"group_{int(group_id)}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / output_name
+    output_path.write_bytes(image_bytes)
+    return str(output_path)
 
 
 def add_account_watermark(image_bytes: bytes, account_name: str) -> bytes:
@@ -994,19 +1093,25 @@ def download_remote_image(url: str) -> bytes:
     return resp.content
 
 
-def call_nanobanana_image(image_path: Path, prompt_text: str) -> bytes:
+def call_nanobanana_image(image_input, prompt_text: str) -> bytes:
     api_key = get_image_api_key()
     if not api_key:
         raise ValueError("没有检测到 IMAGE_API_KEY，请先 export IMAGE_API_KEY")
 
     model_name = get_image_model()
     base_url = get_image_base_url()
-    public_image_url = build_public_image_url(image_path)
+    if isinstance(image_input, (list, tuple)):
+        image_paths = [Path(item) for item in image_input if item]
+    else:
+        image_paths = [Path(image_input)]
+    public_image_urls = build_public_image_urls(image_paths)
+    if not public_image_urls:
+        raise ValueError("缺少可用参考图")
     url = f"{base_url}/{model_name.lstrip('/')}"
 
     payload = {
         "prompt": prompt_text,
-        "image_urls": [public_image_url],
+        "image_urls": public_image_urls,
         "num_images": 1,
     }
 
@@ -1037,35 +1142,43 @@ def call_nanobanana_image(image_path: Path, prompt_text: str) -> bytes:
     return download_remote_image(final_image_url)
 
 
-def call_gemini_image_via_n1n(image_path: Path, prompt_text: str, account_name: str = "") -> bytes:
+def call_gemini_image_via_n1n(image_input, prompt_text: str, account_name: str = "") -> bytes:
     api_key = get_image_api_key()
     if not api_key:
         raise ValueError("没有检测到 IMAGE_API_KEY，请先 export IMAGE_API_KEY")
 
     model_name = get_image_model()
     base_url = get_image_base_url()
-    image_bytes = image_path.read_bytes()
-    encoded = base64.b64encode(image_bytes).decode("utf-8")
-    mime_type = "image/png"
-    suffix = image_path.suffix.lower()
-    if suffix in (".jpg", ".jpeg"):
-        mime_type = "image/jpeg"
-    elif suffix == ".webp":
-        mime_type = "image/webp"
+    if isinstance(image_input, (list, tuple)):
+        image_paths = [Path(item) for item in image_input if item]
+    else:
+        image_paths = [Path(image_input)]
+    if not image_paths:
+        raise ValueError("缺少可用参考图")
 
     url = f"{base_url}/v1beta/models/{model_name}:generateContent"
+    parts = [{"text": prompt_text}]
+    for image_path in image_paths:
+        image_bytes = image_path.read_bytes()
+        encoded = base64.b64encode(image_bytes).decode("utf-8")
+        mime_type = "image/png"
+        suffix = image_path.suffix.lower()
+        if suffix in (".jpg", ".jpeg"):
+            mime_type = "image/jpeg"
+        elif suffix == ".webp":
+            mime_type = "image/webp"
+        parts.append(
+            {
+                "inline_data": {
+                    "mime_type": mime_type,
+                    "data": encoded,
+                }
+            }
+        )
     payload = {
         "contents": [
             {
-                "parts": [
-                    {"text": prompt_text},
-                    {
-                        "inline_data": {
-                            "mime_type": mime_type,
-                            "data": encoded,
-                        }
-                    },
-                ]
+                "parts": parts
             }
         ]
     }
@@ -1109,7 +1222,7 @@ def call_gemini_image_via_n1n(image_path: Path, prompt_text: str, account_name: 
     raise RuntimeError(f"图片模型未返回图片数据: {json.dumps(result, ensure_ascii=False)}")
 
 
-def call_openai_compatible_image(image_path: Path, prompt_text: str) -> bytes:
+def call_openai_compatible_image(image_input, prompt_text: str) -> bytes:
     api_key = get_image_api_key()
     if not api_key:
         raise ValueError("没有检测到 IMAGE_API_KEY，请先 export IMAGE_API_KEY")
@@ -1118,18 +1231,28 @@ def call_openai_compatible_image(image_path: Path, prompt_text: str) -> bytes:
     base_url = get_image_base_url().rstrip("/")
     url = f"{base_url}/v1/images/edits"
     provider = get_image_provider()
+    if isinstance(image_input, (list, tuple)):
+        image_paths = [Path(item) for item in image_input if item]
+    else:
+        image_paths = [Path(image_input)]
+    if not image_paths:
+        raise ValueError("缺少可用参考图")
 
-    suffix = image_path.suffix.lower()
-    mime_type = "image/png"
-    if suffix in (".jpg", ".jpeg"):
-        mime_type = "image/jpeg"
-    elif suffix == ".webp":
-        mime_type = "image/webp"
+    files = []
+    opened_files = []
+    try:
+        for idx, image_path in enumerate(image_paths):
+            suffix = image_path.suffix.lower()
+            mime_type = "image/png"
+            if suffix in (".jpg", ".jpeg"):
+                mime_type = "image/jpeg"
+            elif suffix == ".webp":
+                mime_type = "image/webp"
+            image_file = image_path.open("rb")
+            opened_files.append(image_file)
+            field_name = "image[]" if len(image_paths) > 1 else "image"
+            files.append((field_name, (image_path.name, image_file, mime_type)))
 
-    with image_path.open("rb") as image_file:
-        files = {
-            "image": (image_path.name, image_file, mime_type),
-        }
         data = {
             "model": model_name,
             "prompt": prompt_text,
@@ -1149,6 +1272,12 @@ def call_openai_compatible_image(image_path: Path, prompt_text: str) -> bytes:
             max_retries=1,
             timeout=180,
         )
+    finally:
+        for file_obj in opened_files:
+            try:
+                file_obj.close()
+            except Exception:
+                pass
 
     if resp.status_code != 200:
         raise RuntimeError(f"图片模型接口错误: {resp.text}")

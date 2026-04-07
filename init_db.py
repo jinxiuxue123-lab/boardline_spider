@@ -119,6 +119,50 @@ def init_db() -> None:
     )
     """)
 
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS daily_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_type TEXT NOT NULL,
+        trigger_mode TEXT DEFAULT 'manual',
+        status TEXT DEFAULT 'running',
+        host TEXT,
+        pid INTEGER,
+        log_file TEXT,
+        note TEXT,
+        started_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        finished_at TEXT
+    )
+    """)
+
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS daily_run_steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id INTEGER NOT NULL,
+        step_key TEXT NOT NULL,
+        step_name TEXT NOT NULL,
+        status TEXT DEFAULT 'pending',
+        started_at TEXT,
+        finished_at TEXT,
+        progress_current INTEGER DEFAULT 0,
+        progress_total INTEGER DEFAULT 0,
+        message TEXT,
+        log_excerpt TEXT,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(run_id) REFERENCES daily_runs(id),
+        UNIQUE(run_id, step_key)
+    )
+    """)
+
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_daily_runs_status_started_at
+    ON daily_runs(status, started_at)
+    """)
+
+    cursor.execute("""
+    CREATE INDEX IF NOT EXISTS idx_daily_run_steps_run_id_status
+    ON daily_run_steps(run_id, status)
+    """)
+
     # ==========================
     # 5. 闲鱼发布任务表（提前帮你加好）
     # ==========================

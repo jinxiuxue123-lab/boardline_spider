@@ -23,6 +23,7 @@ from db_utils import (
 )
 from pricing_rules import calculate_cny_pricing, load_pricing_rules
 from xianyu_open.auto_attributes import apply_auto_attributes_for_product
+from daily_run_tracker import get_env_run_id, get_env_step_key, update_step_progress
 
 PROGRESS_FILE = "stock_db_progress_concurrent.txt"
 FAILED_FILE = "failed_stock_urls.txt"
@@ -1190,11 +1191,15 @@ async def main():
 
     total = len(products)
     start = read_progress()
+    run_id = get_env_run_id()
+    step_key = get_env_step_key("boardline_detail_update")
 
     if total <= 0:
         print("待更新商品数: 0")
         print("没有可更新商品")
         clear_file(PROGRESS_FILE)
+        if run_id:
+            update_step_progress(run_id, step_key, current=0, total=0, message="没有可更新商品")
         return
 
     if start >= total:
@@ -1208,6 +1213,14 @@ async def main():
     print("批次大小:", BATCH_SIZE)
     print("折扣规则数:", len(DISCOUNT_RULES))
     print("人民币定价规则数:", len(PRICING_RULES))
+    if run_id:
+        update_step_progress(
+            run_id,
+            step_key,
+            current=start,
+            total=total,
+            message=f"详情库存更新中 | 从第 {start + 1} 个商品开始",
+        )
 
     sem = asyncio.Semaphore(CONCURRENCY)
 
@@ -1237,6 +1250,8 @@ async def main():
             i += len(batch_products)
             write_progress(i)
             print(f"批次完成，当前进度: {i}/{total}")
+            if run_id:
+                update_step_progress(run_id, step_key, current=i, total=total, message=f"详情库存更新中 | {i}/{total}")
 
         retry_round = 0
         while failed_products and retry_round < MAX_FAILED_RETRY_ROUNDS:
@@ -1264,6 +1279,14 @@ async def main():
 
                 j += len(retry_batch)
                 print(f"重试进度: {j}/{retry_total}")
+                if run_id:
+                    update_step_progress(
+                        run_id,
+                        step_key,
+                        current=total - len(failed_products),
+                        total=total,
+                        message=f"详情失败重试中 | 第 {retry_round} 轮 | {j}/{retry_total}",
+                    )
 
         await browser.close()
 
@@ -1273,6 +1296,14 @@ async def main():
     print("成功更新数:", success_count)
     print("最终失败数:", len(failed_products))
     print("失败详情文件:", FAILED_FILE)
+    if run_id:
+        update_step_progress(
+            run_id,
+            step_key,
+            current=total,
+            total=total,
+            message=f"详情库存更新完成 | 成功 {success_count} | 失败 {len(failed_products)}",
+        )
 
 
 if __name__ == "__main__":

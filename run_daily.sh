@@ -17,17 +17,43 @@ fi
 
 cd "$PROJECT_ROOT"
 export PLAYWRIGHT_HEADLESS="${PLAYWRIGHT_HEADLESS:-1}"
+"$PYTHON_BIN" scripts/daily_run_cli.py ensure >/dev/null
+
+OWN_RUN=0
+if [ -z "${DAILY_RUN_ID:-}" ]; then
+  export DAILY_RUN_ID="$("$PYTHON_BIN" scripts/daily_run_cli.py start-run --run-type boardline --trigger-mode shell)"
+  OWN_RUN=1
+fi
+
+run_step() {
+  local step_key="$1"
+  local step_name="$2"
+  shift 2
+  "$PYTHON_BIN" scripts/daily_run_cli.py start-step --step-key "$step_key" --step-name "$step_name"
+  if "$@"; then
+    "$PYTHON_BIN" scripts/daily_run_cli.py finish-step --step-key "$step_key" --status success --message "${step_name}完成"
+  else
+    "$PYTHON_BIN" scripts/daily_run_cli.py finish-step --step-key "$step_key" --status failed --message "${step_name}失败"
+    if [ "$OWN_RUN" -eq 1 ]; then
+      "$PYTHON_BIN" scripts/daily_run_cli.py finish-run --status failed --note "${step_name}失败"
+    fi
+    exit 1
+  fi
+}
 
 echo "[1/4] 开始日常同步..."
-"$PYTHON_BIN" daily_sync.py
+run_step "boardline_run_daily" "Boardline 日常同步" "$PYTHON_BIN" daily_sync.py
 
 echo "[2/4] 刷新折扣与人民币价格..."
-"$PYTHON_BIN" refresh_discount_pricing.py
+run_step "boardline_pricing" "刷新折扣与人民币价格" "$PYTHON_BIN" refresh_discount_pricing.py
 
 echo "[3/4] 导出全量库存表..."
-"$PYTHON_BIN" export_all_stock.py
+run_step "boardline_export" "导出全量库存表" "$PYTHON_BIN" export_all_stock.py
 
 echo "[4/4] 刷新网页展示数据..."
-"$PYTHON_BIN" generate_catalog_site.py
+run_step "boardline_catalog" "刷新网页展示数据" "$PYTHON_BIN" generate_catalog_site.py
 
 echo "全部完成"
+if [ "$OWN_RUN" -eq 1 ]; then
+  "$PYTHON_BIN" scripts/daily_run_cli.py finish-run --status success --note "Boardline 日更完成"
+fi

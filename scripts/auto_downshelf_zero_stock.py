@@ -9,14 +9,16 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from xianyu_open import XianyuOpenClient
-from xianyu_open.payload_builder import build_downshelf_payload
+from xianyu_open.payload_builder import build_downshelf_payload, get_publish_task
 from xianyu_open.stock_utils import parse_total_stock
+from product_grouping import ensure_xianyu_group_task_support
 
 
 DB_FILE = "products.db"
 
 
 def get_candidates():
+    ensure_xianyu_group_task_support()
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -24,6 +26,7 @@ def get_candidates():
         SELECT
             t.id AS task_id,
             t.third_product_id,
+            COALESCE(t.publish_mode, 'single') AS publish_mode,
             t.status,
             t.publish_status,
             a.app_key,
@@ -73,8 +76,17 @@ def main():
     fail_count = 0
 
     for row in rows:
-        total_stock = parse_total_stock(row["stock"])
-        should_down = total_stock <= 0 or row["product_status"] == "inactive"
+        task_stock = row["stock"] or ""
+        if str(row["publish_mode"] or "single").strip() == "group":
+            try:
+                task_stock = get_publish_task(int(row["task_id"])).get("stock") or ""
+            except Exception:
+                task_stock = ""
+        total_stock = parse_total_stock(task_stock)
+        should_down = total_stock <= 0 or (
+            str(row["publish_mode"] or "single").strip() != "group"
+            and row["product_status"] == "inactive"
+        )
         if not should_down:
             skip_count += 1
             continue
@@ -100,7 +112,7 @@ def main():
                 err_code="",
                 err_msg="",
             )
-            print(f"已下架: task={row['task_id']} | product={row['product_id']} | stock={row['stock']}")
+            print(f"已下架: task={row['task_id']} | product={row['product_id']} | stock={task_stock}")
             down_count += 1
         except Exception as e:
             update_task(

@@ -271,11 +271,17 @@ body {
 }
 
 .stock-text,
+.hot-text,
 .update-text {
   margin: 10px 0 0;
   color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
+}
+
+.hot-text {
+  color: var(--accent);
+  font-weight: 600;
 }
 
 .empty-state {

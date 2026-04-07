@@ -21,10 +21,17 @@ function formatPrice(product) {
 }
 
 function filterProducts() {
-  if (currentCategory === "全部") {
-    return data.products;
-  }
-  return data.products.filter((product) => product.category === currentCategory);
+  const products = currentCategory === "全部"
+    ? data.products.slice()
+    : data.products.filter((product) => product.category === currentCategory);
+
+  products.sort((a, b) => {
+    const hotDiff = Number(b.hot_index || 0) - Number(a.hot_index || 0);
+    if (hotDiff !== 0) return hotDiff;
+    return String(a.name || "").localeCompare(String(b.name || ""), "zh-CN");
+  });
+
+  return products;
 }
 
 function renderFilters() {
@@ -147,6 +154,12 @@ function renderProducts() {
     stock.className = "stock-text";
     stock.textContent = `库存: ${product.stock || "暂无库存信息"}`;
 
+    const hot = document.createElement("p");
+    hot.className = "hot-text";
+    hot.textContent = product.hot_index
+      ? `热门指数: ${product.hot_index} · 排名 ${product.hot_rank || "-"}`
+      : "热门指数: 0";
+
     const updated = document.createElement("p");
     updated.className = "update-text";
     updated.textContent = product.updated_at
@@ -158,6 +171,7 @@ function renderProducts() {
     body.appendChild(name);
     body.appendChild(priceBlock);
     body.appendChild(stock);
+    body.appendChild(hot);
     body.appendChild(updated);
 
     link.appendChild(imageWrap);

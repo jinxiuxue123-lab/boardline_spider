@@ -4,6 +4,7 @@ import json
 import math
 import mimetypes
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -16,6 +17,8 @@ from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+import pandas as pd
+
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
@@ -24,21 +27,26 @@ from xianyu_open.reporting import (
     load_account_product_pool,
     load_account_summary,
     load_batches,
+    load_hot_metrics_df,
     load_task_details,
 )
 from xianyu_open.batch_runner import execute_batch, reconcile_remote_created_tasks
 from xianyu_open.downshelf import execute_task_downshelf
 from xianyu_open.delete_product import execute_task_delete_product
-from xianyu_open.payload_builder import build_sku_items
+from xianyu_open.payload_builder import build_sku_items, get_publish_task
 from xianyu_open.image_pipeline import build_standard_png_variant
 from xianyu_open.task_ops import update_batch_counts
 from services.product_image_ai_service import (
     build_watermarked_upload_variant,
     ensure_ai_image_table,
     generate_ai_detail_image,
+    generate_group_ai_cover_image,
     generate_ai_main_image,
+    list_ai_images,
+    load_existing_ai_image,
     set_selected_ai_images,
 )
+from product_grouping import ensure_xianyu_group_task_support, find_group_by_member_ids, find_group_by_member_ids_relaxed, refresh_one8_product_groups
 from taobao_browser import (
     build_publish_assist_payload,
     launch_login_browser,
@@ -47,6 +55,7 @@ from taobao_browser import (
 )
 from scripts.generate_xianyu_ai_copy import (
     ensure_ai_copy_table,
+    load_product_attributes,
     generate_description_for_product,
     generate_descriptions_for_products,
     generate_description_for_task,
@@ -58,6 +67,7 @@ from scripts.generate_xianyu_ai_copy import (
     generate_title_for_task,
     generate_titles_for_batch,
 )
+from services.material_ai_service import build_xianyu_description, build_xianyu_title
 
 
 DB_FILE = "products.db"
@@ -92,6 +102,18 @@ def get_conn():
     return conn
 
 
+def build_group_ai_cover_output_name(account_name: str = "", channel: str = "xianyu") -> str:
+    account_token = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", str(account_name or "").strip())[:40].strip("_")
+    channel_token = re.sub(r"[^0-9A-Za-z_-]+", "_", str(channel or "xianyu").strip().lower()) or "xianyu"
+    if account_token:
+        return f"ai_cover_{channel_token}_{account_token}.jpg"
+    return f"ai_cover_{channel_token}.jpg"
+
+
+def build_group_ai_cover_path(group_id: int, account_name: str = "", channel: str = "xianyu") -> str:
+    return str((ROOT_DIR / "data" / "group_assets" / "one8" / f"group_{int(group_id)}" / build_group_ai_cover_output_name(account_name, channel)).resolve())
+
+
 def display_beijing_time(value, *, date_only: bool = False) -> str:
     raw = str(value or "").strip()
     if not raw:
@@ -110,11 +132,418 @@ def display_beijing_time(value, *, date_only: bool = False) -> str:
         return raw
 
 
+def load_daily_runs(limit: int = 50):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            run_type,
+            trigger_mode,
+            status,
+            host,
+            pid,
+            log_file,
+            note,
+            started_at,
+            finished_at
+        FROM daily_runs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (int(limit),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def load_daily_run(run_id: int):
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT
+            id,
+            run_type,
+            trigger_mode,
+            status,
+            host,
+            pid,
+            log_file,
+            note,
+            started_at,
+            finished_at
+        FROM daily_runs
+        WHERE id = ?
+        LIMIT 1
+        """,
+        (int(run_id),),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def load_daily_run_steps(run_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT
+            id,
+            run_id,
+            step_key,
+            step_name,
+            status,
+            started_at,
+            finished_at,
+            progress_current,
+            progress_total,
+            message,
+            log_excerpt,
+            updated_at
+        FROM daily_run_steps
+        WHERE run_id = ?
+        ORDER BY id ASC
+        """,
+        (int(run_id),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def format_step_progress(row) -> str:
+    current = int(row["progress_current"] or 0)
+    total = int(row["progress_total"] or 0)
+    if total > 0:
+        return f"{current}/{total}"
+    if current > 0:
+        return str(current)
+    return "-"
+
+
 TAOBAO_DAIGOU_SOURCES = {"boardline", "one", "one8"}
+ONE8_GROUPABLE_CATEGORIES = {
+    "固定器",
+    "滑雪鞋",
+    "滑雪服",
+    "手套",
+    "滑雪镜",
+    "滑雪头盔",
+    "滑雪帽衫和中间层",
+}
 
 
 def derive_taobao_inventory_tag(source: str) -> str:
     return "代购" if str(source or "").strip().lower() in TAOBAO_DAIGOU_SOURCES else "现货"
+
+
+def summarize_price_display(series: pd.Series) -> str:
+    values = []
+    for value in series.tolist():
+        text = str(value or "").strip()
+        if not text or text.lower() == "nan":
+            continue
+        values.append(text)
+    if not values:
+        return ""
+    unique_values = list(dict.fromkeys(values))
+    if len(unique_values) == 1:
+        return unique_values[0]
+
+    numeric_values = []
+    for text in unique_values:
+        try:
+            numeric_values.append(float(text))
+        except Exception:
+            numeric_values = []
+            break
+    if numeric_values:
+        low = int(min(numeric_values))
+        high = int(max(numeric_values))
+        return str(low) if low == high else f"{low}-{high}"
+    return unique_values[0]
+
+
+def summarize_stock_by_color(group: pd.DataFrame) -> str:
+    parts = []
+    seen = set()
+    for _, row in group.iterrows():
+        color = str(row.get("color") or "").strip()
+        stock = str(row.get("stock") or "").strip()
+        if not color or color in seen:
+            continue
+        seen.add(color)
+        if stock and stock not in ("-", "nan"):
+            parts.append(f"{color}:{stock}")
+        else:
+            parts.append(color)
+    return " | ".join(parts)
+
+
+def ensure_group_ai_copy_table():
+    conn = get_conn()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS product_group_ai_copy (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            group_id INTEGER NOT NULL,
+            account_name TEXT NOT NULL DEFAULT '',
+            channel TEXT NOT NULL DEFAULT 'xianyu',
+            ai_title TEXT,
+            ai_description TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(group_id, account_name, channel)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_group_ai_copy(group_id: int, account_name: str = "", channel: str = "xianyu"):
+    if int(group_id or 0) <= 0:
+        return None
+    ensure_group_ai_copy_table()
+    conn = get_conn()
+    row = conn.execute(
+        """
+        SELECT group_id, account_name, channel, ai_title, ai_description, created_at, updated_at
+        FROM product_group_ai_copy
+        WHERE group_id = ? AND account_name = ? AND channel = ?
+        LIMIT 1
+        """,
+        (int(group_id), str(account_name or "").strip(), str(channel or "xianyu").strip().lower()),
+    ).fetchone()
+    conn.close()
+    return row
+
+
+def save_group_ai_copy(group_id: int, *, account_name: str = "", channel: str = "xianyu", title: str | None = None, description: str | None = None):
+    ensure_group_ai_copy_table()
+    conn = get_conn()
+    current = conn.execute(
+        """
+        SELECT ai_title, ai_description
+        FROM product_group_ai_copy
+        WHERE group_id = ? AND account_name = ? AND channel = ?
+        LIMIT 1
+        """,
+        (int(group_id), str(account_name or "").strip(), str(channel or "xianyu").strip().lower()),
+    ).fetchone()
+    final_title = title if title is not None else (str(current["ai_title"] or "").strip() if current else "")
+    final_description = description if description is not None else (str(current["ai_description"] or "").strip() if current else "")
+    conn.execute(
+        """
+        INSERT INTO product_group_ai_copy (group_id, account_name, channel, ai_title, ai_description, updated_at)
+        VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(group_id, account_name, channel) DO UPDATE SET
+            ai_title = excluded.ai_title,
+            ai_description = excluded.ai_description,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (int(group_id), str(account_name or "").strip(), str(channel or "xianyu").strip().lower(), final_title, final_description),
+    )
+    conn.commit()
+    conn.close()
+
+
+def build_one8_group_row(group: pd.DataFrame) -> dict:
+    group = group.copy().sort_values(["product_id"])
+    first = group.iloc[0].to_dict()
+    product_ids = [int(pid) for pid in group["product_id"].tolist()]
+    group_row = find_group_by_member_ids_relaxed(product_ids)
+    group_copy = load_group_ai_copy(int(group_row["id"])) if group_row else None
+    colors = [str(color or "").strip() for color in group["color"].tolist() if str(color or "").strip()]
+    unique_colors = list(dict.fromkeys(colors))
+    hot_ranks = [int(rank) for rank in group["hot_rank"].tolist() if int(rank or 0) > 0]
+    hot_indices = [int(value) for value in group["hot_index"].tolist() if int(value or 0) > 0]
+    ai_titles = [str(value or "").strip() for value in group.get("ai_title", pd.Series(dtype=str)).tolist() if str(value or "").strip()]
+    ai_descriptions = [str(value or "").strip() for value in group.get("ai_description", pd.Series(dtype=str)).tolist() if str(value or "").strip()]
+    ai_taobao_titles = [str(value or "").strip() for value in group.get("ai_taobao_title", pd.Series(dtype=str)).tolist() if str(value or "").strip()]
+    ai_taobao_guides = [str(value or "").strip() for value in group.get("ai_taobao_guide_title", pd.Series(dtype=str)).tolist() if str(value or "").strip()]
+    first["merged_group"] = 1
+    first["merged_group_id"] = int(group_row["id"]) if group_row else 0
+    first["merged_group_count"] = len(product_ids)
+    first["merged_product_ids"] = ",".join(str(pid) for pid in product_ids)
+    first["merged_color_summary"] = " | ".join(unique_colors)
+    first["branduid"] = ",".join(str(value) for value in group["branduid"].tolist())
+    first["color"] = " | ".join(unique_colors)
+    first["stock"] = summarize_stock_by_color(group)
+    first["final_price_cny"] = summarize_price_display(group["final_price_cny"])
+    first["upload_count"] = int(group["upload_count"].fillna(0).astype(int).sum()) if "upload_count" in group.columns else 0
+    first["hot_index"] = max(hot_indices) if hot_indices else 0
+    first["hot_rank"] = min(hot_ranks) if hot_ranks else 0
+    first["stock_drop_events"] = int(group["stock_drop_events"].fillna(0).astype(int).sum()) if "stock_drop_events" in group.columns else 0
+    first["stock_sold_units"] = int(group["stock_sold_units"].fillna(0).astype(int).sum()) if "stock_sold_units" in group.columns else 0
+    first["ai_title"] = str((group_copy["ai_title"] if group_copy else "") or "").strip() or (ai_titles[0] if ai_titles else "")
+    first["ai_description"] = str((group_copy["ai_description"] if group_copy else "") or "").strip() or (ai_descriptions[0] if ai_descriptions else "")
+    if "ai_taobao_title" in first:
+        first["ai_taobao_title"] = ai_taobao_titles[0] if ai_taobao_titles else ""
+    if "ai_taobao_guide_title" in first:
+        first["ai_taobao_guide_title"] = ai_taobao_guides[0] if ai_taobao_guides else ""
+    first["ai_images_json"] = "[]"
+    first["ai_detail_images_json"] = "[]"
+    first["ai_main_image_path"] = ""
+    first["group_has_ai_image"] = 0
+    return first
+
+
+def merge_one8_product_groups(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty or "source" not in df.columns:
+        return df
+
+    frame = df.copy()
+    for column, default in (
+        ("merged_group", 0),
+        ("merged_group_id", 0),
+        ("merged_group_count", 1),
+        ("merged_product_ids", ""),
+        ("merged_color_summary", ""),
+        ("group_has_ai_image", 0),
+        ("group_member_row", 0),
+        ("parent_group_id", 0),
+    ):
+        if column not in frame.columns:
+            frame[column] = default
+
+    frame["source"] = frame["source"].fillna("").astype(str).str.strip().str.lower()
+    frame["category"] = frame["category"].fillna("").astype(str).str.strip()
+    frame["name"] = frame["name"].fillna("").astype(str).str.strip()
+    frame["color"] = frame["color"].fillna("").astype(str).str.strip()
+
+    candidates = frame[
+        (frame["source"] == "one8")
+        & (frame["category"].isin(ONE8_GROUPABLE_CATEGORIES))
+        & (frame["name"] != "")
+        & (frame["color"] != "")
+    ].copy()
+    if candidates.empty:
+        return frame
+
+    eligible_keys = set()
+    for (category, name), group in candidates.groupby(["category", "name"], sort=False):
+        if len(group) < 2:
+            continue
+        if group["color"].nunique() < 2:
+            continue
+        eligible_keys.add((category, name))
+
+    if not eligible_keys:
+        return frame
+
+    output_rows = []
+    emitted_keys = set()
+    for _, row in frame.iterrows():
+        key = (str(row.get("category") or "").strip(), str(row.get("name") or "").strip())
+        if key not in eligible_keys:
+            output_rows.append(row.to_dict())
+            continue
+        if key in emitted_keys:
+            continue
+        emitted_keys.add(key)
+        grouped = frame[(frame["category"] == key[0]) & (frame["name"] == key[1]) & (frame["source"] == "one8")]
+        group_row = build_one8_group_row(grouped)
+        group_id = int(group_row.get("merged_group_id") or 0)
+        output_rows.append(group_row)
+        for _, member_row in grouped.sort_values(["product_id"]).iterrows():
+            member = member_row.to_dict()
+            member["group_member_row"] = 1
+            member["parent_group_id"] = group_id
+            output_rows.append(member)
+
+    merged_df = pd.DataFrame(output_rows)
+    for column in df.columns:
+        if column not in merged_df.columns:
+            merged_df[column] = ""
+    return merged_df
+
+
+def load_group_members(group_id: int):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT
+            p.id AS product_id,
+            p.name,
+            p.category,
+            COALESCE(p.color, '') AS color,
+            COALESCE(u.final_price_cny, '') AS final_price_cny,
+            COALESCE(u.stock, '') AS stock
+        FROM product_group_members m
+        JOIN products p ON p.id = m.product_id
+        LEFT JOIN product_updates u ON u.product_id = p.id
+        WHERE m.group_id = ?
+        ORDER BY m.sort_order, p.id
+        """,
+        (int(group_id),),
+    ).fetchall()
+    conn.close()
+    return rows
+
+
+def build_group_copy_product(group_id: int) -> dict:
+    conn = get_conn()
+    group_row = conn.execute(
+        "SELECT id, source, category, group_name FROM product_groups WHERE id = ? LIMIT 1",
+        (int(group_id),),
+    ).fetchone()
+    conn.close()
+    if not group_row:
+        raise ValueError(f"找不到商品组: {group_id}")
+    member_rows = load_group_members(group_id)
+    if not member_rows:
+        raise ValueError(f"商品组没有成员: {group_id}")
+    first = member_rows[0]
+    attrs = load_product_attributes(int(first["product_id"]))
+    prices = []
+    for row in member_rows:
+        try:
+            prices.append(float(str(row["final_price_cny"] or "").strip()))
+        except Exception:
+            pass
+    price_text = str(int(max(prices))) if prices else ""
+    stock_text = " | ".join(
+        f"{str(row['color'] or '').strip()}:{str(row['stock'] or '').strip()}"
+        for row in member_rows
+        if str(row["color"] or "").strip()
+    )
+    return {
+        "group_id": int(group_row["id"]),
+        "product_id": int(first["product_id"]),
+        "name": str(group_row["group_name"] or "").strip(),
+        "category": str(group_row["category"] or "").strip(),
+        "final_price_cny": price_text,
+        "stock": stock_text,
+        "attributes": attrs,
+    }
+
+
+def build_group_description_with_stock(group_product: dict, description: str) -> str:
+    stock_text = str(group_product.get("stock") or "").strip()
+    if not stock_text:
+        return description
+    lines = [part.strip() for part in stock_text.split("|") if part.strip()]
+    if not lines:
+        return description
+    return f"{description.rstrip()}\n\n可选颜色及库存：\n" + "\n".join(lines)
+
+
+def generate_title_for_group(group_id: int, account_name: str = "", channel: str = "xianyu") -> dict:
+    group_product = build_group_copy_product(group_id)
+    title = build_xianyu_title(group_product).strip()
+    if not title:
+        raise ValueError("AI 返回的组标题为空")
+    save_group_ai_copy(group_id, account_name=account_name, channel=channel, title=title, description=None)
+    return {"group_id": int(group_id), "ai_title": title}
+
+
+def generate_description_for_group(group_id: int, account_name: str = "", channel: str = "xianyu") -> dict:
+    group_product = build_group_copy_product(group_id)
+    description = build_xianyu_description(group_product).strip()
+    if not description:
+        raise ValueError("AI 返回的组简介为空")
+    description = build_group_description_with_stock(group_product, description)
+    save_group_ai_copy(group_id, account_name=account_name, channel=channel, title=None, description=description)
+    return {"group_id": int(group_id), "ai_description": description}
 
 
 def ensure_account_ai_copy_support():
@@ -239,6 +668,7 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
             p.source,
             p.category,
             p.name,
+            COALESCE(p.color, '') AS color,
             p.first_seen,
             p.image_url,
             u.final_price_cny,
@@ -258,6 +688,7 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
         ORDER BY p.category, p.id
         """
     ).fetchall()
+    hot_df = load_hot_metrics_df()
     normalized_account_name = (account_name or "").strip()
     ai_rows = conn.execute(
         """
@@ -300,13 +731,23 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
         df["ai_images_json"] = []
         df["ai_detail_images_json"] = []
         df["ai_main_image_path"] = []
+        df["hot_index"] = []
+        df["hot_rank"] = []
+        df["stock_drop_events"] = []
+        df["stock_sold_units"] = []
         return df
     df = df.copy()
+    if not hot_df.empty:
+        df = df.merge(hot_df, on="product_id", how="left")
     df["ai_images_json"] = df["product_id"].apply(lambda pid: json.dumps(resolve_ai_images(main_ai_map, int(pid)), ensure_ascii=False))
     df["ai_detail_images_json"] = df["product_id"].apply(lambda pid: json.dumps(resolve_ai_images(detail_ai_map, int(pid)), ensure_ascii=False))
     df["ai_main_image_path"] = df["product_id"].apply(
         lambda pid: (resolve_ai_images(main_ai_map, int(pid))[0].get("path", "") if resolve_ai_images(main_ai_map, int(pid)) else "")
     )
+    for column in ("hot_index", "hot_rank", "stock_drop_events", "stock_sold_units"):
+        if column not in df.columns:
+            df[column] = 0
+        df[column] = df[column].fillna(0).astype(int)
     return df
 
 
@@ -396,7 +837,14 @@ def page_html(title: str, body: str) -> str:
     .danger-btn {{ background: #8c3b26; }}
     .info-btn {{ background: #1f4f46; }}
     .badge-new {{ display:inline-block; margin-left:8px; padding:2px 8px; border-radius:999px; background:#c95c2d; color:#fff; font-size:12px; font-weight:700; vertical-align:middle; }}
+    .group-member-label {{ display:inline-block; margin-right:6px; padding:2px 8px; border-radius:999px; background:#ece3d3; color:#6e5b3f; font-size:12px; font-weight:600; vertical-align:middle; }}
+    .group-member-name {{ display:inline-block; padding-left:14px; }}
+    .group-row {{ cursor: pointer; }}
+    .group-member-row {{ display: none; }}
+    .group-toggle-hint {{ display:inline-block; margin-left:8px; color:#7b6542; font-size:12px; }}
     .copy-preview {{ max-width: 360px; white-space: pre-wrap; line-height: 1.45; }}
+    .copy-preview.clickable {{ cursor: pointer; }}
+    .copy-preview.clickable:hover {{ background: #faf3e7; border-radius: 10px; }}
     .mask {{ position: fixed; inset: 0; background: rgba(20, 24, 22, 0.58); display: none; align-items: center; justify-content: center; z-index: 9999; }}
     .mask.show {{ display: flex; }}
     .mask-card {{ width: min(420px, calc(100vw - 40px)); background: #fffdf8; border-radius: 18px; padding: 22px; box-shadow: 0 24px 80px rgba(0,0,0,0.18); }}
@@ -408,6 +856,11 @@ def page_html(title: str, body: str) -> str:
     .result-card {{ width: min(720px, calc(100vw - 40px)); background: #fffdf8; border-radius: 18px; padding: 22px; box-shadow: 0 24px 80px rgba(0,0,0,0.18); }}
     .result-text {{ width: 100%; min-height: 220px; resize: vertical; border: 1px solid #ccbfa7; border-radius: 12px; padding: 12px; background: #fff; font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; color: #1f2a24; }}
     .result-actions {{ display:flex; gap:12px; justify-content:flex-end; margin-top: 12px; }}
+    .copy-modal-mask {{ position: fixed; inset: 0; background: rgba(20, 24, 22, 0.58); display: none; align-items: center; justify-content: center; z-index: 10001; }}
+    .copy-modal-mask.show {{ display: flex; }}
+    .copy-modal-card {{ width: min(760px, calc(100vw - 40px)); max-height: calc(100vh - 40px); overflow: auto; background: #fffdf8; border-radius: 18px; padding: 22px; box-shadow: 0 24px 80px rgba(0,0,0,0.18); }}
+    .copy-modal-block {{ white-space: pre-wrap; line-height: 1.6; background: #fff; border: 1px solid #ece3d3; border-radius: 12px; padding: 12px; margin-top: 8px; }}
+    .copy-modal-section + .copy-modal-section {{ margin-top: 14px; }}
     th.sortable {{ cursor: pointer; user-select: none; white-space: nowrap; }}
     th.sortable:hover {{ background: #efe6d6; }}
   </style>
@@ -419,6 +872,7 @@ def page_html(title: str, body: str) -> str:
       <a href="/accounts">账号</a>
       <a href="/taobao/shops">淘宝店铺</a>
       <a href="/batches">批次</a>
+      <a href="/daily-runs">日更任务</a>
       <a href="/callbacks">回调</a>
     </div>
     {body}
@@ -444,6 +898,15 @@ def page_html(title: str, body: str) -> str:
       </div>
     </div>
   </div>
+  <div id="copyPreviewMask" class="copy-modal-mask" aria-hidden="true">
+    <div class="copy-modal-card">
+      <h3 style="margin:0 0 10px;">完整文案</h3>
+      <div id="copyPreviewContent"></div>
+      <div class="result-actions">
+        <button type="button" onclick="closeCopyPreviewModal()">关闭</button>
+      </div>
+    </div>
+  </div>
   <script>
     let progressTimer = null;
     let resultModalReload = false;
@@ -451,6 +914,14 @@ def page_html(title: str, body: str) -> str:
     let progressBaseText = "后台正在处理，请不要关闭页面。";
     function currentProductFilterStorageKey() {{
       return `accountProductFilter:${{window.location.pathname}}?${{window.location.search}}`;
+    }}
+    function escapeHtml(value) {{
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }}
     function parseSortValue(text) {{
       const raw = (text || "").replace(/\\s+/g, " ").trim();
@@ -462,28 +933,31 @@ def page_html(title: str, body: str) -> str:
       }}
       return {{ type: "text", value: raw.toLowerCase() }};
     }}
+    function renderSortableHeader(header, dir = "") {{
+      const label = header.dataset.sortLabel || header.textContent.replace(/[↑↓]/g, "").trim();
+      header.dataset.sortLabel = label;
+      header.innerHTML = `${{escapeHtml(label)}}${{dir === "asc" ? " ↑" : (dir === "desc" ? " ↓" : "")}}`;
+    }}
     function initSortableTables() {{
       document.querySelectorAll("table[data-sortable='true']").forEach((table) => {{
         const headers = Array.from(table.querySelectorAll("th[data-sort-index]"));
         headers.forEach((header) => {{
           header.classList.add("sortable");
+          renderSortableHeader(header, header.dataset.sortDir || "");
           header.addEventListener("click", () => {{
             const index = Number(header.dataset.sortIndex || "-1");
             if (index < 0) return;
             const tbody = table.tBodies[0];
             const rows = tbody
-              ? Array.from(tbody.querySelectorAll("tr")).filter((row) => row.children.length)
-              : Array.from(table.querySelectorAll("tr")).slice(1).filter((row) => row.children.length);
+              ? Array.from(tbody.querySelectorAll("tr")).filter((row) => row.querySelectorAll("td").length > 0)
+              : Array.from(table.querySelectorAll("tr")).filter((row) => row.querySelectorAll("td").length > 0);
             const currentDir = header.dataset.sortDir === "asc" ? "desc" : "asc";
             headers.forEach((item) => {{
               item.dataset.sortDir = "";
-              const label = item.dataset.sortLabel || item.textContent.replace(/[↑↓]/g, "").trim();
-              item.textContent = label;
+              renderSortableHeader(item, "");
             }});
             header.dataset.sortDir = currentDir;
-            const headerLabel = header.dataset.sortLabel || header.textContent.replace(/[↑↓]/g, "").trim();
-            header.dataset.sortLabel = headerLabel;
-            header.textContent = `${{headerLabel}}${{currentDir === "asc" ? " ↑" : " ↓"}}`;
+            renderSortableHeader(header, currentDir);
             rows.sort((a, b) => {{
               const aCell = a.children[index];
               const bCell = b.children[index];
@@ -504,6 +978,16 @@ def page_html(title: str, body: str) -> str:
             }}
           }});
         }});
+      }});
+    }}
+    function toggleGroupMembers(groupId) {{
+      const id = String(groupId || "").trim();
+      if (!id) return;
+      const rows = Array.from(document.querySelectorAll(`tr[data-parent-group-id="${{id}}"]`));
+      if (!rows.length) return;
+      const shouldShow = rows.every((row) => row.style.display === "none" || row.style.display === "");
+      rows.forEach((row) => {{
+        row.style.display = shouldShow ? "table-row" : "none";
       }});
     }}
     function showProgressMask(initialText = "后台正在处理，请不要关闭页面。") {{
@@ -565,6 +1049,28 @@ def page_html(title: str, body: str) -> str:
         resultModalReload = false;
         window.location.reload();
       }}
+    }}
+    function closeCopyPreviewModal() {{
+      document.getElementById("copyPreviewMask").classList.remove("show");
+    }}
+    function openCopyPreviewModal(node) {{
+      if (!node) return;
+      const title = node.dataset.fullTitle || "";
+      const guideTitle = node.dataset.fullGuideTitle || "";
+      const description = node.dataset.fullDescription || "";
+      const content = document.getElementById("copyPreviewContent");
+      const sections = [];
+      if (title) {{
+        sections.push(`<div class="copy-modal-section"><strong>标题</strong><div class="copy-modal-block">${{escapeHtml(title)}}</div></div>`);
+      }}
+      if (guideTitle) {{
+        sections.push(`<div class="copy-modal-section"><strong>导购标题</strong><div class="copy-modal-block">${{escapeHtml(guideTitle)}}</div></div>`);
+      }}
+      if (description) {{
+        sections.push(`<div class="copy-modal-section"><strong>简介</strong><div class="copy-modal-block">${{escapeHtml(description)}}</div></div>`);
+      }}
+      content.innerHTML = sections.length ? sections.join("") : '<div class="muted">暂无完整文案</div>';
+      document.getElementById("copyPreviewMask").classList.add("show");
     }}
     async function copyResultText() {{
       const textarea = document.getElementById("resultText");
@@ -901,6 +1407,47 @@ def page_html(title: str, body: str) -> str:
         showResultModal(`AI${{modeLabel}}生成失败`, `AI${{modeLabel}}生成失败\\n${{error && error.message ? error.message : error}}`);
       }}
     }}
+    async function generateGroupProductAi(button, mode) {{
+      const groupId = button.dataset.groupId || "";
+      const rawProductIds = button.dataset.productIds || "";
+      const accountName = button.dataset.accountName || new URLSearchParams(window.location.search).get("name") || "";
+      const channel = button.dataset.aiChannel || (window.location.pathname.startsWith("/taobao/") ? "taobao" : "xianyu");
+      const productIds = rawProductIds.split(",").map((item) => item.trim()).filter((item) => /^\\d+$/.test(item));
+      const modeLabel = mode === "title" ? "标题" : "简介";
+      if (!groupId || !productIds.length) {{
+        alert("缺少组商品参数");
+        return;
+      }}
+      showProgressMask();
+      try {{
+        const resp = await fetch("/product-group/generate-ai-copy", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+          body: new URLSearchParams({{
+            group_id: groupId,
+            product_ids: productIds.join(","),
+            mode,
+            account_name: accountName,
+            channel,
+          }}).toString(),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.ok === false) {{
+          throw new Error(data.message || `组商品AI${{modeLabel}}生成失败`);
+        }}
+        hideProgressMask(data.message || `组商品AI${{modeLabel}}生成完成`);
+        showResultModal(`组商品AI${{modeLabel}}结果`, [
+          `组商品AI${{modeLabel}}生成完成`,
+          `组ID: ${{groupId}}`,
+          `组内商品数: ${{productIds.length}}`,
+          `标题: ${{data.ai_title || "-"}}`,
+          `简介: ${{data.ai_description ? "已生成" : "-"}}`
+        ].join("\\n"), true);
+      }} catch (error) {{
+        hideProgressMask(`组商品AI${{modeLabel}}生成失败`);
+        showResultModal(`组商品AI${{modeLabel}}生成失败`, `组商品AI${{modeLabel}}生成失败\\n${{error && error.message ? error.message : error}}`);
+      }}
+    }}
     async function generateProductImageAi(button, assetType = "main") {{
       const productId = button.dataset.productId || "";
       const accountName = button.dataset.accountName || new URLSearchParams(window.location.search).get("name") || "";
@@ -928,6 +1475,48 @@ def page_html(title: str, body: str) -> str:
       }} catch (error) {{
         hideProgressMask(isDetail ? "AI详情图生成失败" : "AI主图生成失败");
         showResultModal(isDetail ? "AI详情图生成失败" : "AI主图生成失败", `${{isDetail ? "AI详情图生成失败" : "AI主图生成失败"}}\n${{error && error.message ? error.message : error}}`);
+      }}
+    }}
+    async function generateGroupProductImageAi(button) {{
+      const rawProductIds = button.dataset.productIds || "";
+      const accountName = button.dataset.accountName || new URLSearchParams(window.location.search).get("name") || "";
+      const channel = button.dataset.aiChannel || (window.location.pathname.startsWith("/taobao/") ? "taobao" : "xianyu");
+      const groupId = button.dataset.groupId || "";
+      const productIds = rawProductIds.split(",").map((item) => item.trim()).filter((item) => /^\\d+$/.test(item));
+      if (!groupId || !productIds.length) {{
+        alert("缺少组商品参数");
+        return;
+      }}
+      showProgressMask();
+      try {{
+        const resp = await fetch("/product-group/generate-ai-image", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+          body: new URLSearchParams({{
+            group_id: groupId,
+            product_ids: productIds.join(","),
+            account_name: accountName,
+            channel,
+          }}).toString(),
+        }});
+        const data = await resp.json();
+        if (!resp.ok || data.ok === false) {{
+          throw new Error(data.message || "组商品AI主图生成失败");
+        }}
+        if (!data.job_id) {{
+          throw new Error("组商品AI主图任务提交成功，但缺少任务ID");
+        }}
+        const result = await pollImageJob(data.job_id, groupId, {{ assetType: "main", silent: true }});
+        hideProgressMask(result.message || "组商品AI主图生成完成");
+        showResultModal("组商品AI主图生成完成", [
+          "组商品AI主图生成完成",
+          `组ID: ${{groupId}}`,
+          `组内商品数: ${{productIds.length}}`,
+          `封面路径: ${{result.ai_main_image_path || ""}}`
+        ].join("\\n"), true);
+      }} catch (error) {{
+        hideProgressMask("组商品AI主图生成失败");
+        showResultModal("组商品AI主图生成失败", `组商品AI主图生成失败\\n${{error && error.message ? error.message : error}}`);
       }}
     }}
     async function pollImageJob(jobId, productId, options = {{}}) {{
@@ -980,10 +1569,24 @@ def page_html(title: str, body: str) -> str:
       let completedCount = 0;
       const failedItems = [];
       const concurrency = 3;
+      const jobs = selected.map((input) => {{
+        const rawValue = String(input.value || "").trim();
+        const productIds = expandProductIds(rawValue);
+        const groupId = String(input.dataset.groupId || "").trim();
+        const isGroup = String(input.dataset.isGroup || "0") === "1" && !!groupId;
+        const channel = String(input.dataset.aiChannel || (window.location.pathname.startsWith("/taobao/") ? "taobao" : "xianyu")).trim();
+        return {{
+          isGroup,
+          groupId,
+          productIds,
+          rawValue,
+          channel,
+        }};
+      }});
       function updateBatchImageProgress() {{
-        const text = `批量生成AI主图中（已完成 ${{completedCount}}/${{selected.length}}） 成功 ${{successCount}}，跳过 ${{skippedCount}}，失败 ${{failedCount}}`;
+        const text = `批量生成AI主图中（已完成 ${{completedCount}}/${{jobs.length}}） 成功 ${{successCount}}，跳过 ${{skippedCount}}，失败 ${{failedCount}}`;
         progressBaseText = text;
-        const percent = Math.max(5, Math.min(95, Math.round((completedCount / selected.length) * 95)));
+        const percent = Math.max(5, Math.min(95, Math.round((completedCount / jobs.length) * 95)));
         const bar = document.getElementById("progressBar");
         const percentNode = document.getElementById("progressPercent");
         const textNode = document.getElementById("progressText");
@@ -1003,37 +1606,55 @@ def page_html(title: str, body: str) -> str:
       }}
       try {{
         updateBatchImageProgress();
-        async function processOne(input) {{
-          const productId = input.value || "";
-          if (!productId) {{
-            completedCount += 1;
-            updateBatchImageProgress();
-            return;
-          }}
-          if ((input.dataset.hasAiImage || "") === "1") {{
-            skippedCount += 1;
+        async function processOne(job) {{
+          if (!job || (!job.isGroup && !job.productIds.length)) {{
             completedCount += 1;
             updateBatchImageProgress();
             return;
           }}
           try {{
-            const resp = await fetch("/product/generate-ai-image", {{
-              method: "POST",
-              headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
-              body: new URLSearchParams({{ product_id: productId, account_name: accountName }}).toString(),
-            }});
-            const data = await resp.json();
-            if (!resp.ok || data.ok === false) {{
-              throw new Error(data.message || "AI主图生成失败");
+            if (job.isGroup) {{
+              const resp = await fetch("/product-group/generate-ai-image", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+                body: new URLSearchParams({{
+                  group_id: job.groupId,
+                  product_ids: job.productIds.join(","),
+                  account_name: accountName,
+                  channel: job.channel,
+                }}).toString(),
+              }});
+              const data = await resp.json();
+              if (!resp.ok || data.ok === false) {{
+                throw new Error(data.message || "组商品AI主图生成失败");
+              }}
+              if (!data.job_id) {{
+                throw new Error("组商品AI主图任务提交成功，但缺少任务ID");
+              }}
+              await pollImageJob(data.job_id, job.productIds[0] || "", {{ silent: true }});
+            }} else {{
+              const productId = job.productIds[0] || "";
+              const resp = await fetch("/product/generate-ai-image", {{
+                method: "POST",
+                headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+                body: new URLSearchParams({{ product_id: productId, account_name: accountName, channel: job.channel }}).toString(),
+              }});
+              const data = await resp.json();
+              if (!resp.ok || data.ok === false) {{
+                throw new Error(data.message || "AI主图生成失败");
+              }}
+              if (!data.job_id) {{
+                throw new Error("AI主图任务提交成功，但缺少任务ID");
+              }}
+              await pollImageJob(data.job_id, productId, {{ silent: true }});
             }}
-            if (!data.job_id) {{
-              throw new Error("AI主图任务提交成功，但缺少任务ID");
-            }}
-            await pollImageJob(data.job_id, productId, {{ silent: true }});
             successCount += 1;
           }} catch (error) {{
             failedCount += 1;
-            failedItems.push(`商品ID ${{productId}}: ${{error && error.message ? error.message : error}}`);
+            const label = job.isGroup
+              ? `组商品(group_id=${{job.groupId}})`
+              : `商品ID ${{job.productIds[0] || "-"}}`;
+            failedItems.push(`${{label}}: ${{error && error.message ? error.message : error}}`);
           }} finally {{
             completedCount += 1;
             updateBatchImageProgress();
@@ -1041,18 +1662,18 @@ def page_html(title: str, body: str) -> str:
         }}
         let cursor = 0;
         async function worker() {{
-          while (cursor < selected.length) {{
+          while (cursor < jobs.length) {{
             const currentIndex = cursor;
             cursor += 1;
-            await processOne(selected[currentIndex]);
+            await processOne(jobs[currentIndex]);
           }}
         }}
-        const workers = Array.from({{ length: Math.min(concurrency, selected.length) }}, () => worker());
+        const workers = Array.from({{ length: Math.min(concurrency, jobs.length) }}, () => worker());
         await Promise.all(workers);
         hideProgressMask(`批量生成完成，成功 ${{successCount}}，跳过 ${{skippedCount}}，失败 ${{failedCount}}`);
         const lines = [
           "批量AI主图生成完成",
-          `总数: ${{selected.length}}`,
+          `总数: ${{jobs.length}}`,
           `成功: ${{successCount}}`,
           `跳过: ${{skippedCount}}`,
           `失败: ${{failedCount}}`,
@@ -1069,48 +1690,80 @@ def page_html(title: str, body: str) -> str:
     }}
     async function generateSelectedProductAi(mode) {{
       const accountName = new URLSearchParams(window.location.search).get("name") || "";
-      const selected = getVisibleSelectedProducts();
+      const selectedInputs = getVisibleSelectedProducts();
       const modeLabel = mode === "title" ? "标题" : (mode === "description" ? "简介" : "标题和简介");
-      if (!selected.length) {{
+      if (!selectedInputs.length) {{
         alert("请先勾选商品");
         return;
       }}
+      const jobs = selectedInputs.map((input) => {{
+        const rawValue = String(input.value || "").trim();
+        const productIds = expandProductIds(rawValue);
+        const groupId = String(input.dataset.groupId || "").trim();
+        const isGroup = String(input.dataset.isGroup || "0") === "1" && !!groupId;
+        const channel = String(input.dataset.aiChannel || (window.location.pathname.startsWith("/taobao/") ? "taobao" : "xianyu")).trim();
+        return {{
+          isGroup,
+          groupId,
+          productIds,
+          rawValue,
+          channel,
+        }};
+      }}).filter((item) => item.isGroup ? !!item.groupId && item.productIds.length > 0 : item.productIds.length > 0);
+      if (!jobs.length) {{
+        alert("未找到有效商品ID");
+        return;
+      }}
       showProgressMask(`正在批量生成AI${{modeLabel}}，系统会在后台分批处理，请耐心等待。`);
+      let successCount = 0;
+      let failedCount = 0;
+      const failedItems = [];
       try {{
-        const productIds = selected.map((item) => item.value || "").filter(Boolean).join(",");
-        const resp = await fetch("/products/generate-ai-batch", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
-          body: new URLSearchParams({{ product_ids: productIds, mode, account_name: accountName }}).toString(),
-        }});
-        const data = await resp.json();
-        if (!resp.ok || data.ok === false) {{
-          throw new Error(data.message || `批量AI${{modeLabel}}生成失败`);
+        for (let index = 0; index < jobs.length; index += 1) {{
+          const item = jobs[index] || {{}};
+          progressBaseText = `正在批量生成AI${{modeLabel}}（已完成 ${{index}}/${{jobs.length}}）`;
+          let resp;
+          if (item.isGroup && item.groupId) {{
+            resp = await fetch("/product-group/generate-ai-copy", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+              body: new URLSearchParams({{
+                group_id: String(item.groupId),
+                product_ids: (item.productIds || []).join(","),
+                mode,
+                account_name: accountName,
+                channel: item.channel || (window.location.pathname.startsWith("/taobao/") ? "taobao" : "xianyu"),
+              }}).toString(),
+            }});
+          }} else {{
+            resp = await fetch("/products/generate-ai-batch", {{
+              method: "POST",
+              headers: {{ "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }},
+              body: new URLSearchParams({{
+                product_ids: (item.productIds || []).join(","),
+                mode,
+                account_name: accountName,
+              }}).toString(),
+            }});
+          }}
+          const data = await resp.json();
+          if (!resp.ok || data.ok === false) {{
+            failedCount += 1;
+            failedItems.push(item.isGroup ? `组ID ${{item.groupId || "-"}}: ${{data.message || "失败"}}` : `商品ID ${{(item.productIds || [])[0] || "-"}}: ${{data.message || "失败"}}`);
+            continue;
+          }}
+          successCount += 1;
         }}
-        hideProgressMask(`批量生成完成，成功 ${{data.success_count || 0}}，失败 ${{data.failed_count || 0}}`);
+        hideProgressMask(`批量生成完成，成功 ${{successCount}}，失败 ${{failedCount}}`);
         const lines = [
           `批量AI${{modeLabel}}生成完成`,
-          `总数: ${{data.total_count || selected.length}}`,
-          `成功: ${{data.success_count || 0}}`,
-          `跳过: ${{data.skipped_count || 0}}`,
-          `失败: ${{data.failed_count || 0}}`,
+          `总数: ${{jobs.length}}`,
+          `成功: ${{successCount}}`,
+          `失败: ${{failedCount}}`,
         ];
-        if (mode === "both") {{
-          lines.push(
-            "",
-            "简介结果：",
-            `成功: ${{data.description_success_count || 0}}`,
-            `跳过: ${{data.description_skipped_count || 0}}`,
-            `失败: ${{data.description_failed_count || 0}}`,
-          );
-        }}
-        if ((data.failures || []).length) {{
+        if (failedItems.length) {{
           lines.push("", "失败明细:");
-          lines.push(...data.failures.map((item) => `商品ID ${{item.product_id || "-"}}: ${{item.error || "失败"}}`));
-        }}
-        if (mode === "both" && (data.description_failures || []).length) {{
-          lines.push("", "简介失败明细:");
-          lines.push(...data.description_failures.map((item) => `商品ID ${{item.product_id || "-"}}: ${{item.error || "失败"}}`));
+          lines.push(...failedItems);
         }}
         showResultModal(`批量AI${{modeLabel}}结果`, lines.join("\\n"), true);
       }} catch (error) {{
@@ -1149,10 +1802,43 @@ def page_html(title: str, body: str) -> str:
         updateSelectionRowState(input);
       }});
     }}
+    function expandProductIds(rawValue) {{
+      return String(rawValue || "")
+        .split(",")
+        .map((item) => item.trim())
+        .filter((item) => /^\\d+$/.test(item));
+    }}
+    function getSelectedProductIds() {{
+      const ids = [];
+      getVisibleSelectedProducts().forEach((input) => {{
+        expandProductIds(input.value).forEach((productId) => ids.push(productId));
+      }});
+      return Array.from(new Set(ids));
+    }}
     function getVisibleSelectedProducts() {{
-      return Array.from(document.querySelectorAll("input[name='product_id']:checked")).filter((item) => {{
+      const selected = Array.from(document.querySelectorAll("input[name='product_id']:checked")).filter((item) => {{
         const row = item.closest("tr");
         return !row || row.style.display !== "none";
+      }});
+      const selectedGroupIds = new Set(
+        selected
+          .map((item) => String(item.dataset.groupId || "").trim())
+          .filter((groupId, index) => {{
+            if (!groupId) return false;
+            const isGroup = String(selected[index].dataset.isGroup || "0") === "1";
+            return isGroup;
+          }})
+      );
+      return selected.filter((item) => {{
+        const row = item.closest("tr");
+        if (!row || !row.classList.contains("group-member-row")) {{
+          return true;
+        }}
+        const parentGroupId = String(row.dataset.parentGroupId || "").trim();
+        if (!parentGroupId) {{
+          return true;
+        }}
+        return !selectedGroupIds.has(parentGroupId);
       }});
     }}
     function filterCurrentPageProducts(keyword) {{
@@ -1662,6 +2348,48 @@ def product_ai_main_image_cell(product_id: int, ai_images_json: str = "", accoun
     return f"<div class='thumb-grid'>{''.join(parts)}</div>"
 
 
+def _load_group_ai_gallery(group_id: int, merged_product_ids: str = "", account_name: str = "", channel: str = "xianyu") -> list[dict]:
+    items: list[dict] = []
+    if group_id > 0:
+        cover_path = build_group_ai_cover_path(group_id, account_name, channel)
+        if cover_path and Path(cover_path).exists():
+            items.append(
+                {
+                    "type": "group_cover",
+                    "label": "组封面",
+                    "path": cover_path,
+                    "product_id": 0,
+                    "image_id": 0,
+                    "selected": 0,
+                }
+            )
+    for raw_id in str(merged_product_ids or "").split(","):
+        raw_id = raw_id.strip()
+        if not raw_id.isdigit():
+            continue
+        product_id = int(raw_id)
+        conn = get_conn()
+        product_row = conn.execute("SELECT COALESCE(color, '') AS color FROM products WHERE id = ? LIMIT 1", (product_id,)).fetchone()
+        conn.close()
+        color_label = str((product_row["color"] if product_row else "") or "").strip() or f"成员{product_id}"
+        ai_images = list_ai_images(product_id, account_name=account_name, asset_type="main")
+        for item in ai_images:
+            image_path = str(item.get("ai_main_image_path") or "").strip()
+            if not image_path:
+                continue
+            items.append(
+                {
+                    "type": "member_ai",
+                    "label": color_label,
+                    "path": image_path,
+                    "product_id": product_id,
+                    "image_id": int(item.get("id") or 0),
+                    "selected": int(item.get("selected") or 0),
+                }
+            )
+    return items
+
+
 def product_ai_detail_cell(product_id: int, ai_images_json: str = "", account_name: str = "") -> str:
     parts = []
     ai_images = _pick_display_ai_images(ai_images_json, account_name)
@@ -1705,6 +2433,151 @@ def product_image_gallery_cell(product_id: int, remote_url: str, ai_images_json:
     return f"<div class='thumb-grid'>{''.join(parts)}</div>"
 
 
+def row_has_display_ai_images(row, account_name: str = "", channel: str = "xianyu") -> bool:
+    if int(row.get("merged_group") or 0) == 1:
+        group_id = int(row.get("merged_group_id") or 0)
+        merged_product_ids = str(row.get("merged_product_ids") or "")
+        return len(_load_group_ai_gallery(group_id, merged_product_ids, account_name, channel)) > 0
+    return len(_pick_display_ai_images(str(row.get("ai_images_json") or "[]"), account_name)) > 0
+
+
+def batch_task_image_gallery_cell(row) -> str:
+    if str(row.get("publish_mode") or "single").strip() != "group":
+        return product_image_gallery_cell(
+            int(row["product_id"]),
+            str(row.get("image_url") or ""),
+            str(row.get("ai_images_json") or "[]"),
+            str(row.get("account_name") or ""),
+        )
+
+    selected_group_images_json = str(row.get("selected_group_images_json") or "").strip()
+    if selected_group_images_json:
+        try:
+            selected_group_images = json.loads(selected_group_images_json)
+        except Exception:
+            selected_group_images = []
+        parts = []
+        for item in selected_group_images if isinstance(selected_group_images, list) else []:
+            if not isinstance(item, dict):
+                continue
+            image_path = str(item.get("path") or "").strip()
+            if not image_path:
+                continue
+            media_url = html.escape(local_media_url(image_path))
+            label = html.escape(str(item.get("label") or "图片"))
+            parts.append(
+                "<div class='thumb-item'>"
+                f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='group-selected'></a>"
+                f"<span class='muted'>{label}</span>"
+                "</div>"
+            )
+        if parts:
+            return f"<div class='thumb-grid'>{''.join(parts)}</div>"
+
+    account_name = str(row.get("account_name") or "")
+    group_id = int(row.get("group_id") or 0)
+    merged_product_ids = str(row.get("group_member_product_ids") or "")
+    cover_image_path = str(row.get("cover_image_path") or "").strip()
+    parts = []
+
+    if cover_image_path:
+        media_url = html.escape(local_media_url(cover_image_path))
+        parts.append(
+            "<div class='thumb-item'>"
+            f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='group-cover'></a>"
+            "<span class='muted'>组封面</span>"
+            "</div>"
+        )
+
+    for item in _load_group_ai_gallery(group_id, merged_product_ids, account_name, "xianyu"):
+        if item.get("type") == "group_cover":
+            continue
+        media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+        label = html.escape(str(item.get("label") or "AI图"))
+        parts.append(
+            "<div class='thumb-item'>"
+            f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='group-gallery'></a>"
+            f"<span class='muted'>{label}</span>"
+            "</div>"
+        )
+
+    if not parts:
+        return "<div class='thumb'></div>"
+    return f"<div class='thumb-grid'>{''.join(parts)}</div>"
+
+
+def product_ai_main_image_cell_for_row(row, account_name: str = "", channel: str = "xianyu") -> str:
+    if int(row.get("merged_group") or 0) == 1:
+        group_id = int(row.get("merged_group_id") or 0)
+        merged_product_ids = str(row.get("merged_product_ids") or "")
+        parts = []
+        for item in _load_group_ai_gallery(group_id, merged_product_ids, account_name, channel):
+            media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+            label = html.escape(str(item.get("label") or "AI图"))
+            if item.get("type") == "member_ai":
+                product_id = int(item.get("product_id") or 0)
+                image_id = int(item.get("image_id") or 0)
+                checked = " checked" if int(item.get("selected") or 0) == 1 else ""
+                parts.append(
+                    "<div class='thumb-item'>"
+                    f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='ai-main'></a>"
+                    f"<label class='muted'><input class='thumb-check' type='checkbox' value='{image_id}' data-ai-select-product='{product_id}' data-ai-select-account='{html.escape(account_name)}' onchange='saveAiImageSelection({product_id}, {json.dumps(account_name, ensure_ascii=False)})'{checked}>上传</label>"
+                    f"<span class='muted'>{label}</span>"
+                    "</div>"
+                )
+            else:
+                parts.append(
+                    "<div class='thumb-item'>"
+                    f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='group-cover'></a>"
+                    f"<label class='muted'><input class='thumb-check' type='checkbox' name='group_cover_selected' value='{group_id}' checked onclick='event.stopPropagation()'>封面</label>"
+                    f"<span class='muted'>{label}</span>"
+                    "</div>"
+                )
+        if not parts:
+            return "<span class='muted'>未生成</span>"
+        return f"<div class='thumb-grid'>{''.join(parts)}</div>"
+    return product_ai_main_image_cell(int(row["product_id"]), str(row.get("ai_images_json") or "[]"), account_name)
+
+
+def product_image_gallery_cell_for_row(row, account_name: str = "", channel: str = "xianyu") -> str:
+    if int(row.get("merged_group") or 0) == 1:
+        parts = []
+        remote_url = str(row.get("image_url") or "").strip()
+        if remote_url.startswith("http://") or remote_url.startswith("https://"):
+            safe = html.escape(remote_url)
+            parts.append(
+                f"<div class='thumb-item'><a href='{safe}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{safe}' alt='product'></a><span class='muted'>原图</span></div>"
+            )
+        group_id = int(row.get("merged_group_id") or 0)
+        merged_product_ids = str(row.get("merged_product_ids") or "")
+        for item in _load_group_ai_gallery(group_id, merged_product_ids, account_name, channel):
+            media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+            label = html.escape(str(item.get("label") or "AI图"))
+            if item.get("type") == "member_ai":
+                product_id = int(item.get("product_id") or 0)
+                image_id = int(item.get("image_id") or 0)
+                checked = " checked" if int(item.get("selected") or 0) == 1 else ""
+                parts.append(
+                    "<div class='thumb-item'>"
+                    f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='group-gallery'></a>"
+                    f"<label class='muted'><input class='thumb-check' type='checkbox' value='{image_id}' data-ai-select-product='{product_id}' data-ai-select-account='{html.escape(account_name)}' onchange='saveAiImageSelection({product_id}, {json.dumps(account_name, ensure_ascii=False)})'{checked}>上传</label>"
+                    f"<span class='muted'>{label}</span>"
+                    "</div>"
+                )
+            else:
+                parts.append(
+                    "<div class='thumb-item'>"
+                    f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='group-gallery'></a>"
+                    f"<label class='muted'><input class='thumb-check' type='checkbox' name='group_cover_selected' value='{group_id}' checked onclick='event.stopPropagation()'>封面</label>"
+                    f"<span class='muted'>{label}</span>"
+                    "</div>"
+                )
+        if not parts:
+            return "<div class='thumb'></div>"
+        return f"<div class='thumb-grid'>{''.join(parts)}</div>"
+    return product_image_gallery_cell(int(row["product_id"]), str(row.get("image_url") or ""), str(row.get("ai_images_json") or "[]"), account_name)
+
+
 def safe_text(value) -> str:
     if value is None:
         return ""
@@ -1718,6 +2591,39 @@ def preview_text(value, limit: int = 180) -> str:
     if not text:
         return ""
     return text[:limit] + ("..." if len(text) > limit else "")
+
+
+def copy_preview_modal_cell(title: str = "", description: str = "", guide_title: str = "", preview_html: str = "") -> str:
+    full_title = safe_text(title)
+    full_description = safe_text(description)
+    full_guide_title = safe_text(guide_title)
+    if not full_title and not full_description and not full_guide_title:
+        return "<span class='muted'>未生成</span>"
+    attrs = " ".join([
+        f"data-full-title='{html.escape(full_title, quote=True)}'",
+        f"data-full-guide-title='{html.escape(full_guide_title, quote=True)}'",
+        f"data-full-description='{html.escape(full_description, quote=True)}'",
+    ])
+    return f"<div class='copy-preview clickable' onclick='openCopyPreviewModal(this)' {attrs}>{preview_html}</div>"
+
+
+def group_copy_preview_cell(group_id: int, account_name: str = "", channel: str = "xianyu") -> str:
+    if int(group_id or 0) <= 0:
+        return "<span class='muted'>-</span>"
+    group_copy = load_group_ai_copy(int(group_id), account_name=account_name, channel=channel)
+    if not group_copy:
+        return "<span class='muted'>未生成</span>"
+    ai_title_raw = safe_text(group_copy["ai_title"])
+    ai_description_full = safe_text(group_copy["ai_description"])
+    ai_description_raw = preview_text(ai_description_full)
+    if not ai_title_raw and not ai_description_full:
+        return "<span class='muted'>未生成</span>"
+    parts = []
+    if ai_title_raw:
+        parts.append(f"<div><strong>标题：</strong>{html.escape(ai_title_raw)}</div>")
+    if ai_description_raw:
+        parts.append(f"<div style='margin-top:6px;'><strong>简介：</strong>{html.escape(ai_description_raw)}</div>")
+    return copy_preview_modal_cell(ai_title_raw, ai_description_full, "", "".join(parts))
 
 
 def sku_preview_cell(row) -> str:
@@ -1741,6 +2647,32 @@ def sku_preview_cell(row) -> str:
             parts.append(f"<div style='margin-top:6px;'>{html.escape(stock_text)}</div>")
         parts.append(f"<div class='muted' style='margin-top:6px;'>上传库存：{total_stock}</div></div>")
         return "".join(parts)
+
+    sku_lines = "".join(
+        f"<div>{html.escape(str(item.get('sku_text') or ''))}</div>"
+        for item in sku_items
+    )
+    return f"<div class='copy-preview'>{sku_lines}<div class='muted' style='margin-top:6px;'>上传库存：{total_stock}</div></div>"
+
+
+def batch_task_sku_preview_cell(row) -> str:
+    if str(row.get("publish_mode") or "single").strip() != "group":
+        return sku_preview_cell(row)
+
+    try:
+        task = get_publish_task(int(row["task_id"]))
+        sku_items, total_stock = build_sku_items(task, 1)
+    except Exception:
+        stock_text = safe_text(row.get("stock"))
+        if not stock_text:
+            return "<span class='muted'>未生成</span>"
+        return f"<div class='copy-preview'><div>{html.escape(stock_text)}</div></div>"
+
+    if not sku_items:
+        stock_text = safe_text(task.get("stock") or row.get("stock"))
+        if not stock_text:
+            return "<span class='muted'>未生成</span>"
+        return f"<div class='copy-preview'><div>{html.escape(stock_text)}</div><div class='muted' style='margin-top:6px;'>上传库存：{total_stock}</div></div>"
 
     sku_lines = "".join(
         f"<div>{html.escape(str(item.get('sku_text') or ''))}</div>"
@@ -1778,11 +2710,14 @@ class AdminHandler(BaseHTTPRequestHandler):
 
     def send_html(self, title: str, body: str, status: int = 200):
         body_bytes = page_html(title, body).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body_bytes)))
-        self.end_headers()
-        self.wfile.write(body_bytes)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.end_headers()
+            self.wfile.write(body_bytes)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def send_json(self, payload: dict, status: int = 200):
         body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -1843,6 +2778,10 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return self.render_batches()
             if path == "/batch":
                 return self.render_batch_detail(params)
+            if path == "/daily-runs":
+                return self.render_daily_runs()
+            if path == "/daily-run":
+                return self.render_daily_run_detail(params)
             if path == "/callbacks":
                 return self.render_callbacks()
             if path == "/product/generate-ai-image-status":
@@ -1852,6 +2791,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             if path == "/batch/delete-status":
                 return self.get_batch_delete_status(params)
             self.send_html("未找到", "<div class='card'><h1>404</h1></div>", 404)
+        except (BrokenPipeError, ConnectionResetError):
+            return
         except Exception:
             print(
                 f"[admin] GET {self.path} from {self.client_address[0]} failed",
@@ -1882,8 +2823,12 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return self.generate_product_ai()
             if parsed.path == "/products/generate-ai-batch":
                 return self.generate_products_ai_batch()
+            if parsed.path == "/product-group/generate-ai-copy":
+                return self.generate_group_product_ai_copy()
             if parsed.path == "/product/generate-ai-image":
                 return self.generate_product_ai_image()
+            if parsed.path == "/product-group/generate-ai-image":
+                return self.generate_group_product_ai_image()
             if parsed.path == "/product/generate-ai-detail-image":
                 return self.generate_product_ai_detail_image()
             if parsed.path == "/product/select-ai-images":
@@ -1928,6 +2873,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         summary = load_account_summary()
         batches = load_batches().head(10)
         tasks = load_task_details().head(20)
+        daily_runs = load_daily_runs(8)
 
         total_accounts = len(summary)
         total_uploaded = int(summary["uploaded_count"].fillna(0).sum()) if not summary.empty else 0
@@ -1950,12 +2896,17 @@ class AdminHandler(BaseHTTPRequestHandler):
             f"<tr><td>{int(row['task_id'])}</td><td>{image_cell(str(row.get('image_url') or ''))}</td><td>{html.escape(str(row['account_name']))}</td><td>{html.escape(str(row['name']))}</td><td>{html.escape(str(row['status']))}</td><td>{html.escape(str(row['publish_status'] or ''))}</td><td>{html.escape(str(row['callback_status'] or ''))}</td></tr>"
             for _, row in tasks.iterrows()
         )
+        run_rows = "".join(
+            f"<tr><td><a href='/daily-run?id={int(row['id'])}'>{int(row['id'])}</a></td><td>{html.escape(str(row['run_type'] or ''))}</td><td>{html.escape(str(row['status'] or ''))}</td><td>{html.escape(display_beijing_time(row['started_at']))}</td><td>{html.escape(display_beijing_time(row['finished_at']))}</td><td>{html.escape(str(row['note'] or ''))}</td></tr>"
+            for row in daily_runs
+        )
         self.send_html(
             "闲鱼后台总览",
             metrics
             + f"""
             <div class="card"><h2>最近批次</h2><table><tr><th>ID</th><th>账号</th><th>批次名</th><th>状态</th><th>总数</th><th>成功</th><th>失败</th></tr>{batch_rows}</table></div>
             <div class="card"><h2>最近任务</h2><table><tr><th>任务ID</th><th>图片</th><th>账号</th><th>商品</th><th>状态</th><th>上架状态</th><th>回调状态</th></tr>{task_rows}</table></div>
+            <div class="card"><h2>最近日更任务</h2><table><tr><th>Run ID</th><th>类型</th><th>状态</th><th>开始时间</th><th>结束时间</th><th>备注</th></tr>{run_rows}</table></div>
             """,
         )
 
@@ -2145,10 +3096,14 @@ class AdminHandler(BaseHTTPRequestHandler):
         product_pool = load_taobao_product_pool(shop_account_name)
         if category != "全部":
             product_pool = product_pool[product_pool["category"] == category]
+        product_pool = merge_one8_product_groups(product_pool)
         if not product_pool.empty:
             product_pool = product_pool.copy()
-            product_pool["ai_image_status"] = product_pool["ai_images_json"].apply(
-                lambda value: "已生成AI图" if str(value or "[]").strip() not in ("", "[]") else "未生成AI图"
+            if "group_has_ai_image" not in product_pool.columns:
+                product_pool["group_has_ai_image"] = 0
+            product_pool["ai_image_status"] = product_pool.apply(
+                lambda row: "已生成AI图" if row_has_display_ai_images(row, shop_account_name, "taobao") else "未生成AI图",
+                axis=1,
             )
             if ai_image_filter != "全部":
                 product_pool = product_pool[product_pool["ai_image_status"] == ai_image_filter]
@@ -2163,14 +3118,20 @@ class AdminHandler(BaseHTTPRequestHandler):
         def product_name_cell(row):
             name = html.escape(str(row["name"]))
             first_seen = display_beijing_time(row.get("first_seen"), date_only=True)
+            group_badge = ""
+            if int(row.get("merged_group") or 0) == 1:
+                group_badge = f"<span class='badge-new'>组内{int(row.get('merged_group_count') or 0)}款</span><span class='group-toggle-hint'>点击展开</span>"
+            if int(row.get("group_member_row") or 0) == 1:
+                return f"<span class='group-member-label'>组内成员</span><span class='group-member-name'>{name}</span>"
             if first_seen == today:
-                return f"{name}<span class='badge-new'>今日新增</span>"
-            return name
+                return f"{name}{group_badge}<span class='badge-new'>今日新增</span>"
+            return f"{name}{group_badge}"
 
         def copy_preview_cell(row):
             ai_title_raw = safe_text(row.get("ai_taobao_title")) or safe_text(row.get("ai_title"))
             ai_guide_title_raw = safe_text(row.get("ai_taobao_guide_title"))
-            ai_description_raw = preview_text(row.get("ai_description"))
+            ai_description_full = safe_text(row.get("ai_description"))
+            ai_description_raw = preview_text(ai_description_full)
             ai_title = html.escape(ai_title_raw)
             ai_guide_title = html.escape(ai_guide_title_raw)
             ai_description = html.escape(ai_description_raw)
@@ -2183,13 +3144,35 @@ class AdminHandler(BaseHTTPRequestHandler):
                 parts.append(f"<div style='margin-top:6px;'><strong>导购标题：</strong>{ai_guide_title}</div>")
             if ai_description:
                 parts.append(f"<div style='margin-top:6px;'><strong>简介：</strong>{ai_description}</div>")
-            return f"<div class='copy-preview'>{''.join(parts)}</div>"
+            return copy_preview_modal_cell(ai_title_raw, ai_description_full, ai_guide_title_raw, ''.join(parts))
+
+        def group_copy_cell(row):
+            if int(row.get("merged_group") or 0) != 1:
+                return "<span class='muted'>-</span>"
+            return group_copy_preview_cell(int(row.get("merged_group_id") or 0), shop_account_name, "taobao")
+
+        def row_action_cell(row):
+            if int(row.get("merged_group") or 0) == 1:
+                merged_ids = html.escape(str(row.get("merged_product_ids") or ""))
+                group_id = int(row.get("merged_group_id") or 0)
+                return (
+                    f"<button type='button' class='mini-btn ghost-btn' data-group-id='{group_id}' data-product-ids='{merged_ids}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateGroupProductAi(this, 'title')\">生成标题</button> "
+                    f"<button type='button' class='mini-btn ghost-btn' data-group-id='{group_id}' data-product-ids='{merged_ids}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateGroupProductAi(this, 'description')\">生成简介</button> "
+                    f"<button type='button' class='mini-btn info-btn' data-group-id='{group_id}' data-product-ids='{merged_ids}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateGroupProductImageAi(this)\">生成AI主图</button>"
+                )
+            return (
+                f"<button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick=\"generateProductAi(this, 'title')\">生成标题</button> "
+                f"<button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick=\"generateProductAi(this, 'description')\">生成简介</button> "
+                f"<button type='button' class='mini-btn info-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateProductImageAi(this, 'main')\">生成AI主图</button> "
+                f"<button type='button' class='mini-btn info-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateProductImageAi(this, 'detail')\">生成AI详情图</button> "
+                f"<button type='button' class='mini-btn danger-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick='publishProductToTaobao(this)'>淘宝发布助手</button>"
+            )
 
         option_rows = "".join(
-            f"<tr data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name'])]))}'>"
-            f"<td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{int(row['product_id'])}' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if str(row.get('ai_images_json') or '[]').strip() not in ('', '[]') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td>"
+            f"<tr class='{'group-row' if int(row.get('merged_group') or 0) == 1 else ('group-member-row' if int(row.get('group_member_row') or 0) == 1 else '')}' data-parent-group-id='{int(row.get('parent_group_id') or 0)}' data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name'])]))}' {'onclick=\"toggleGroupMembers(' + str(int(row.get('merged_group_id') or 0)) + ')\"' if int(row.get('merged_group') or 0) == 1 else ''}>"
+            f"<td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{html.escape(str(row.get('merged_product_ids') or int(row['product_id'])))}' data-group-id='{int(row.get('merged_group_id') or 0)}' data-is-group='{'1' if int(row.get('merged_group') or 0) == 1 else '0'}' data-ai-channel='taobao' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if row_has_display_ai_images(row, shop_account_name, 'taobao') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td>"
             f"<td>{product_origin_image_cell(str(row.get('image_url') or ''))}</td>"
-            f"<td>{product_ai_main_image_cell(int(row['product_id']), str(row.get('ai_images_json') or '[]'), shop_account_name)}</td>"
+            f"<td>{product_ai_main_image_cell_for_row(row, shop_account_name, 'taobao')}</td>"
             f"<td>{product_ai_detail_cell(int(row['product_id']), str(row.get('ai_detail_images_json') or '[]'), shop_account_name)}</td>"
             f"<td>{int(row['product_id'])}</td>"
             f"<td>{html.escape(str(row.get('source') or ''))}</td>"
@@ -2199,8 +3182,10 @@ class AdminHandler(BaseHTTPRequestHandler):
             f"<td>{html.escape(display_beijing_time(row.get('first_seen')))}</td>"
             f"<td>{html.escape(str(row['final_price_cny'] or ''))}</td>"
             f"<td>{html.escape(str(row['stock'] or ''))}</td>"
+            f"<td>{int(row.get('hot_index') or 0)}</td>"
             f"<td>{copy_preview_cell(row)}</td>"
-            f"<td><button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick=\"generateProductAi(this, 'title')\">生成标题</button> <button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick=\"generateProductAi(this, 'description')\">生成简介</button> <button type='button' class='mini-btn info-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateProductImageAi(this, 'main')\">生成AI主图</button> <button type='button' class='mini-btn info-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' data-ai-channel='taobao' onclick=\"generateProductImageAi(this, 'detail')\">生成AI详情图</button> <button type='button' class='mini-btn danger-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(shop_account_name)}' onclick='publishProductToTaobao(this)'>淘宝发布助手</button></td>"
+            f"<td>{group_copy_cell(row)}</td>"
+            f"<td>{row_action_cell(row)}</td>"
             f"</tr>"
             for _, row in paged_pool.iterrows()
         )
@@ -2245,8 +3230,8 @@ class AdminHandler(BaseHTTPRequestHandler):
             <span class='muted' id='currentPageProductFilterSummary'></span>
           </div>
           <div class='table-wrap'>
-            <table>
-              <tr><th><input type='checkbox' onclick='toggleAllProducts(this)' aria-label='全选商品'></th><th>图片</th><th>AI主图</th><th>AI详情</th><th>商品ID</th><th>来源</th><th>类型</th><th>分类</th><th>名称</th><th>首次发现</th><th>价格</th><th>库存</th><th>AI文案预览</th><th>操作</th></tr>
+            <table data-sortable='true'>
+              <tr><th><input type='checkbox' onclick='toggleAllProducts(this)' aria-label='全选商品'></th><th>图片</th><th>AI主图</th><th>AI详情</th><th>商品ID</th><th>来源</th><th>类型</th><th>分类</th><th>名称</th><th>首次发现</th><th>价格</th><th>库存</th><th data-sort-index='12' data-sort-label='热门指数'>热门指数</th><th>AI文案预览</th><th>组文案</th><th>操作</th></tr>
               {option_rows}
             </table>
           </div>
@@ -2385,6 +3370,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         if category != "全部":
             tasks = tasks[tasks["category"] == category]
             product_pool = product_pool[product_pool["category"] == category]
+        product_pool = merge_one8_product_groups(product_pool)
 
         def upload_status_label(row):
             latest_status = str(row.get("latest_status") or "")
@@ -2400,8 +3386,9 @@ class AdminHandler(BaseHTTPRequestHandler):
         if not product_pool.empty:
             product_pool = product_pool.copy()
             product_pool["display_status"] = product_pool.apply(upload_status_label, axis=1)
-            product_pool["ai_image_status"] = product_pool["ai_images_json"].apply(
-                lambda value: "已生成AI图" if str(value or "[]").strip() not in ("", "[]") else "未生成AI图"
+            product_pool["ai_image_status"] = product_pool.apply(
+                lambda row: "已生成AI图" if row_has_display_ai_images(row, account_name, "xianyu") else "未生成AI图",
+                axis=1,
             )
             if upload_status_filter != "全部":
                 product_pool = product_pool[product_pool["display_status"] == upload_status_filter]
@@ -2425,13 +3412,19 @@ class AdminHandler(BaseHTTPRequestHandler):
         def product_name_cell(row):
             name = html.escape(str(row["name"]))
             first_seen = display_beijing_time(row.get("first_seen"), date_only=True)
+            group_badge = ""
+            if int(row.get("merged_group") or 0) == 1:
+                group_badge = f"<span class='badge-new'>组内{int(row.get('merged_group_count') or 0)}款</span><span class='group-toggle-hint'>点击展开</span>"
+            if int(row.get("group_member_row") or 0) == 1:
+                return f"<span class='group-member-label'>组内成员</span><span class='group-member-name'>{name}</span>"
             if first_seen == today:
-                return f"{name}<span class='badge-new'>今日新增</span>"
-            return name
+                return f"{name}{group_badge}<span class='badge-new'>今日新增</span>"
+            return f"{name}{group_badge}"
 
         def copy_preview_cell(row):
             ai_title_raw = safe_text(row.get("ai_title"))
-            ai_description_raw = preview_text(row.get("ai_description"))
+            ai_description_full = safe_text(row.get("ai_description"))
+            ai_description_raw = preview_text(ai_description_full)
             ai_title = html.escape(ai_title_raw)
             ai_description = html.escape(ai_description_raw)
             if not ai_title and not ai_description:
@@ -2441,7 +3434,27 @@ class AdminHandler(BaseHTTPRequestHandler):
                 parts.append(f"<div><strong>标题：</strong>{ai_title}</div>")
             if ai_description:
                 parts.append(f"<div style='margin-top:6px;'><strong>简介：</strong>{ai_description}</div>")
-            return f"<div class='copy-preview'>{''.join(parts)}</div>"
+            return copy_preview_modal_cell(ai_title_raw, ai_description_full, "", ''.join(parts))
+
+        def group_copy_cell(row):
+            if int(row.get("merged_group") or 0) != 1:
+                return "<span class='muted'>-</span>"
+            return group_copy_preview_cell(int(row.get("merged_group_id") or 0), account_name, "xianyu")
+
+        def row_action_cell(row):
+            if int(row.get("merged_group") or 0) == 1:
+                merged_ids = html.escape(str(row.get("merged_product_ids") or ""))
+                group_id = int(row.get("merged_group_id") or 0)
+                return (
+                    f"<button type='button' class='mini-btn ghost-btn' data-group-id='{group_id}' data-product-ids='{merged_ids}' data-account-name='{html.escape(account_name)}' data-ai-channel='xianyu' onclick=\"generateGroupProductAi(this, 'title')\">生成标题</button> "
+                    f"<button type='button' class='mini-btn ghost-btn' data-group-id='{group_id}' data-product-ids='{merged_ids}' data-account-name='{html.escape(account_name)}' data-ai-channel='xianyu' onclick=\"generateGroupProductAi(this, 'description')\">生成简介</button> "
+                    f"<button type='button' class='mini-btn info-btn' data-group-id='{group_id}' data-product-ids='{merged_ids}' data-account-name='{html.escape(account_name)}' data-ai-channel='xianyu' onclick=\"generateGroupProductImageAi(this)\">生成AI主图</button>"
+                )
+            return (
+                f"<button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(account_name)}' onclick=\"generateProductAi(this, 'title')\">生成标题</button> "
+                f"<button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(account_name)}' onclick=\"generateProductAi(this, 'description')\">生成简介</button> "
+                f"<button type='button' class='mini-btn info-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(account_name)}' data-ai-channel='xianyu' onclick=\"generateProductImageAi(this)\">生成AI主图</button>"
+            )
 
         selected_batch_ids = set()
 
@@ -2460,7 +3473,7 @@ class AdminHandler(BaseHTTPRequestHandler):
             )
         task_rows = "".join(task_row_parts)
         option_rows = "".join(
-            f"<tr data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name'])]))}'><td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{int(row['product_id'])}' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if str(row.get('ai_images_json') or '[]').strip() not in ('', '[]') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td><td>{product_image_gallery_cell(int(row['product_id']), str(row.get('image_url') or ''), str(row.get('ai_images_json') or '[]'), account_name)}</td><td>{int(row['product_id'])}</td><td>{html.escape(str(row['category']))}</td><td>{product_name_cell(row)}</td><td>{html.escape(display_beijing_time(row.get('first_seen')))}</td><td>{html.escape(str(row['final_price_cny'] or ''))}</td><td>{html.escape(str(row['stock'] or ''))}</td><td>{copy_preview_cell(row)}</td><td><button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(account_name)}' onclick=\"generateProductAi(this, 'title')\">生成标题</button> <button type='button' class='mini-btn ghost-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(account_name)}' onclick=\"generateProductAi(this, 'description')\">生成简介</button> <button type='button' class='mini-btn info-btn' data-product-id='{int(row['product_id'])}' data-account-name='{html.escape(account_name)}' data-ai-channel='xianyu' onclick=\"generateProductImageAi(this)\">生成AI主图</button></td><td>{html.escape(str(row.get('display_status') or ''))}</td><td>{html.escape(str(row.get('latest_status') or ''))}</td><td>{int(row.get('upload_count') or 0)}</td></tr>"
+            f"<tr class='{'group-row' if int(row.get('merged_group') or 0) == 1 else ('group-member-row' if int(row.get('group_member_row') or 0) == 1 else '')}' data-parent-group-id='{int(row.get('parent_group_id') or 0)}' data-product-filter-text='{html.escape(' '.join([str(int(row['product_id'])), str(row['category']), str(row['name']), str(row.get('merged_color_summary') or '')]))}' {'onclick=\"toggleGroupMembers(' + str(int(row.get('merged_group_id') or 0)) + ')\"' if int(row.get('merged_group') or 0) == 1 else ''}><td class='select-cell' onclick='toggleRowCheckbox(this)'><input type='checkbox' name='product_id' value='{html.escape(str(row.get('merged_product_ids') or int(row['product_id'])))}' data-group-id='{int(row.get('merged_group_id') or 0)}' data-is-group='{'1' if int(row.get('merged_group') or 0) == 1 else '0'}' data-ai-channel='xianyu' data-has-ai-title='{'1' if safe_text(row.get('ai_title')) else '0'}' data-has-ai-description='{'1' if safe_text(row.get('ai_description')) else '0'}' data-has-ai-image='{'1' if row_has_display_ai_images(row, account_name, 'xianyu') else '0'}' onclick='event.stopPropagation(); updateSelectionRowState(this)'></td><td>{product_image_gallery_cell_for_row(row, account_name, 'xianyu')}</td><td>{int(row['product_id'])}</td><td>{html.escape(str(row['category']))}</td><td>{product_name_cell(row)}</td><td>{html.escape(display_beijing_time(row.get('first_seen')))}</td><td>{html.escape(str(row['final_price_cny'] or ''))}</td><td>{html.escape(str(row['stock'] or ''))}</td><td>{int(row.get('hot_index') or 0)}</td><td>{copy_preview_cell(row)}</td><td>{group_copy_cell(row)}</td><td>{row_action_cell(row)}</td><td>{html.escape(str(row.get('display_status') or ''))}</td><td>{html.escape(str(row.get('latest_status') or ''))}</td><td>{int(row.get('upload_count') or 0)}</td></tr>"
             for _, row in paged_pool.iterrows()
         )
         category_buttons = "".join(
@@ -2521,8 +3534,8 @@ class AdminHandler(BaseHTTPRequestHandler):
               <button type='submit'>生成批次</button>
             </div>
             <div class='table-wrap'>
-              <table>
-                <tr><th><input type='checkbox' onclick='toggleAllProducts(this)' aria-label='全选商品'></th><th>图片</th><th>商品ID</th><th>分类</th><th>名称</th><th>首次发现</th><th>价格</th><th>库存</th><th>AI文案预览</th><th>AI操作</th><th>上传标记</th><th>最近状态</th><th>上传次数</th></tr>
+                <table data-sortable='true'>
+                  <tr><th><input type='checkbox' onclick='toggleAllProducts(this)' aria-label='全选商品'></th><th>图片</th><th>商品ID</th><th>分类</th><th>名称</th><th>首次发现</th><th>价格</th><th>库存</th><th data-sort-index='8' data-sort-label='热门指数'>热门指数</th><th>AI文案预览</th><th>组文案</th><th>AI操作</th><th>上传标记</th><th>最近状态</th><th>上传次数</th></tr>
                 {option_rows}
               </table>
             </div>
@@ -2566,6 +3579,98 @@ class AdminHandler(BaseHTTPRequestHandler):
                 <table>
                   <tr><th><input type='checkbox' onclick='toggleAllBatchRows(this)' aria-label='全选批次'></th><th>ID</th><th>账号</th><th>批次名</th><th>状态</th><th>总数</th><th>成功</th><th>失败</th><th>操作</th></tr>
                   {rows}
+                </table>
+              </div>
+            </div>
+            """,
+        )
+
+    def render_daily_runs(self):
+        rows = load_daily_runs(100)
+        html_rows = "".join(
+            f"<tr><td><a href='/daily-run?id={int(row['id'])}'>{int(row['id'])}</a></td><td>{html.escape(str(row['run_type'] or ''))}</td><td>{html.escape(str(row['trigger_mode'] or ''))}</td><td>{html.escape(str(row['status'] or ''))}</td><td>{html.escape(str(row['host'] or ''))}</td><td>{html.escape(str(row['pid'] or ''))}</td><td>{html.escape(display_beijing_time(row['started_at']))}</td><td>{html.escape(display_beijing_time(row['finished_at']))}</td><td>{html.escape(str(row['log_file'] or ''))}</td><td>{html.escape(str(row['note'] or ''))}</td></tr>"
+            for row in rows
+        )
+        self.send_html(
+            "日更任务",
+            f"""
+            <div class='card'>
+              <h1>日更任务</h1>
+              <div class='muted'>展示最近 100 轮日更运行记录，可点击查看每一步详情。</div>
+              <div class='table-wrap'>
+                <table data-sortable='true'>
+                  <thead>
+                    <tr>
+                      <th data-sort-index='0'>Run ID</th>
+                      <th data-sort-index='1'>类型</th>
+                      <th data-sort-index='2'>触发方式</th>
+                      <th data-sort-index='3'>状态</th>
+                      <th data-sort-index='4'>主机</th>
+                      <th data-sort-index='5'>PID</th>
+                      <th data-sort-index='6'>开始时间</th>
+                      <th data-sort-index='7'>结束时间</th>
+                      <th data-sort-index='8'>日志文件</th>
+                      <th data-sort-index='9'>备注</th>
+                    </tr>
+                  </thead>
+                  <tbody>{html_rows}</tbody>
+                </table>
+              </div>
+            </div>
+            """,
+        )
+
+    def render_daily_run_detail(self, params):
+        run_id = (params.get("id") or [""])[0]
+        if not run_id.isdigit():
+            return self.send_html("参数错误", "<div class='card'>缺少有效日更任务ID</div>", 400)
+        run_row = load_daily_run(int(run_id))
+        if not run_row:
+            return self.send_html("未找到任务", "<div class='card'>日更任务不存在</div>", 404)
+        step_rows = load_daily_run_steps(int(run_id))
+        rows_html = "".join(
+            f"<tr><td>{html.escape(str(row['step_key'] or ''))}</td><td>{html.escape(str(row['step_name'] or ''))}</td><td>{html.escape(str(row['status'] or ''))}</td><td>{html.escape(format_step_progress(row))}</td><td>{html.escape(str(row['message'] or ''))}</td><td>{html.escape(display_beijing_time(row['started_at']))}</td><td>{html.escape(display_beijing_time(row['finished_at']))}</td><td>{html.escape(display_beijing_time(row['updated_at']))}</td></tr>"
+            for row in step_rows
+        )
+        meta = f"""
+        <div class='card'>
+          <h1>日更任务 #{int(run_row['id'])}</h1>
+          <div class='grid'>
+            <div class='metric'><span>类型</span><strong style='font-size:20px;'>{html.escape(str(run_row['run_type'] or ''))}</strong></div>
+            <div class='metric'><span>状态</span><strong style='font-size:20px;'>{html.escape(str(run_row['status'] or ''))}</strong></div>
+            <div class='metric'><span>触发方式</span><strong style='font-size:20px;'>{html.escape(str(run_row['trigger_mode'] or ''))}</strong></div>
+            <div class='metric'><span>PID</span><strong style='font-size:20px;'>{html.escape(str(run_row['pid'] or ''))}</strong></div>
+          </div>
+          <div class='toolbar' style='margin-top:14px;'>
+            <span class='muted'>开始：{html.escape(display_beijing_time(run_row['started_at']))}</span>
+            <span class='muted'>结束：{html.escape(display_beijing_time(run_row['finished_at']))}</span>
+            <span class='muted'>主机：{html.escape(str(run_row['host'] or ''))}</span>
+          </div>
+          <div class='muted' style='margin-top:8px;'>日志：{html.escape(str(run_row['log_file'] or ''))}</div>
+          <div class='muted' style='margin-top:6px;'>备注：{html.escape(str(run_row['note'] or ''))}</div>
+        </div>
+        """
+        self.send_html(
+            f"日更任务 #{int(run_row['id'])}",
+            meta
+            + f"""
+            <div class='card'>
+              <h2>步骤详情</h2>
+              <div class='table-wrap'>
+                <table data-sortable='true'>
+                  <thead>
+                    <tr>
+                      <th data-sort-index='0'>步骤Key</th>
+                      <th data-sort-index='1'>步骤名称</th>
+                      <th data-sort-index='2'>状态</th>
+                      <th data-sort-index='3'>进度</th>
+                      <th data-sort-index='4'>消息</th>
+                      <th data-sort-index='5'>开始时间</th>
+                      <th data-sort-index='6'>结束时间</th>
+                      <th data-sort-index='7'>最近更新时间</th>
+                    </tr>
+                  </thead>
+                  <tbody>{rows_html}</tbody>
                 </table>
               </div>
             </div>
@@ -2621,12 +3726,20 @@ class AdminHandler(BaseHTTPRequestHandler):
             return ""
         row_parts = []
         for _, row in tasks.iterrows():
-            title_preview = html.escape(safe_text(row.get("ai_title")))
+            title_raw = safe_text(row.get("ai_title"))
+            description_full = safe_text(row.get("ai_description"))
+            title_preview = html.escape(title_raw)
             if not title_preview:
                 title_preview = "<span class='muted'>未生成</span>"
-            description_preview = html.escape(preview_text(row.get("ai_description")))
+            description_preview = html.escape(preview_text(description_full))
+            preview_html = f"<div><strong>标题：</strong>{title_preview}</div><div style='margin-top:6px;'><strong>简介：</strong>{description_preview}</div>"
+            display_name = safe_text(row.get("name"))
+            if str(row.get("publish_mode") or "single").strip() == "group":
+                member_count = len([item for item in str(row.get("group_member_product_ids") or "").split(",") if item.strip()])
+                if member_count > 0:
+                    display_name = f"{display_name} 组内{member_count}款"
             row_parts.append(
-                f"<tr class='{batch_row_class(row)}'><td>{int(row['task_id'])}</td><td>{product_image_gallery_cell(int(row['product_id']), str(row.get('image_url') or ''), str(row.get('ai_images_json') or '[]'), str(row.get('account_name') or ''))}</td><td>{html.escape(str(row['account_name']))}</td><td>{html.escape(str(row['name']))}</td><td>{sku_preview_cell(row)}</td><td><div class='copy-preview'><div><strong>标题：</strong>{title_preview}</div><div style='margin-top:6px;'><strong>简介：</strong>{description_preview}</div></div></td><td><button type='button' class='mini-btn ghost-btn' data-task-id='{int(row['task_id'])}' data-account-name='{html.escape(str(row.get('account_name') or ''))}' onclick=\"generateProductAi(this, 'title')\">生成标题</button> <button type='button' class='mini-btn ghost-btn' data-task-id='{int(row['task_id'])}' data-account-name='{html.escape(str(row.get('account_name') or ''))}' onclick=\"generateProductAi(this, 'description')\">生成简介</button></td><td>{html.escape(str(row['status']))}</td><td>{html.escape(display_publish_status(str(row.get('publish_status') or ''), str(row.get('callback_status') or '')))}</td><td>{html.escape(extract_publish_schedule(str(row.get('task_result') or ''), str(row.get('status') or ''), str(row.get('publish_status') or ''), str(row.get('callback_status') or '')))}</td><td>{html.escape(str(row['callback_status'] or ''))}</td><td>{html.escape(str(row['third_product_id'] or ''))}</td><td>{html.escape(str(row['err_msg'] or ''))}</td></tr>"
+                f"<tr class='{batch_row_class(row)}'><td>{int(row['task_id'])}</td><td>{batch_task_image_gallery_cell(row)}</td><td>{html.escape(str(row['account_name']))}</td><td>{html.escape(display_name)}</td><td>{batch_task_sku_preview_cell(row)}</td><td>{copy_preview_modal_cell(title_raw, description_full, '', preview_html)}</td><td><button type='button' class='mini-btn ghost-btn' data-task-id='{int(row['task_id'])}' data-account-name='{html.escape(str(row.get('account_name') or ''))}' onclick=\"generateProductAi(this, 'title')\">生成标题</button> <button type='button' class='mini-btn ghost-btn' data-task-id='{int(row['task_id'])}' data-account-name='{html.escape(str(row.get('account_name') or ''))}' onclick=\"generateProductAi(this, 'description')\">生成简介</button></td><td>{html.escape(str(row['status']))}</td><td>{html.escape(display_publish_status(str(row.get('publish_status') or ''), str(row.get('callback_status') or '')))}</td><td>{html.escape(extract_publish_schedule(str(row.get('task_result') or ''), str(row.get('status') or ''), str(row.get('publish_status') or ''), str(row.get('callback_status') or '')))}</td><td>{html.escape(str(row['callback_status'] or ''))}</td><td>{html.escape(str(row['third_product_id'] or ''))}</td><td>{html.escape(str(row['err_msg'] or ''))}</td></tr>"
             )
         rows = "".join(row_parts)
         self.send_html(
@@ -2670,12 +3783,23 @@ class AdminHandler(BaseHTTPRequestHandler):
         account_name = (form.get("account_name") or [""])[0].strip()
         category = (form.get("category") or ["全部"])[0].strip()
         page = (form.get("page") or ["1"])[0].strip()
-        product_ids = [pid for pid in form.get("product_id", []) if pid.isdigit()]
+        selected_group_cover_ids = {
+            int(item.strip())
+            for item in form.get("group_cover_selected", [])
+            if str(item or "").strip().isdigit()
+        }
+        selected_items = []
+        for raw_value in form.get("product_id", []):
+            ids = [int(item.strip()) for item in str(raw_value or "").split(",") if item.strip().isdigit()]
+            if not ids:
+                continue
+            selected_items.append({"raw": str(raw_value or "").strip(), "product_ids": list(dict.fromkeys(ids))})
 
-        if not account_name or not product_ids:
+        if not account_name or not selected_items:
             return self.send_html("参数错误", "<div class='card'>账号和商品不能为空</div>", 400)
 
         batch_name = self.build_auto_batch_name(category)
+        ensure_xianyu_group_task_support()
 
         conn = get_conn()
         cur = conn.cursor()
@@ -2690,11 +3814,79 @@ class AdminHandler(BaseHTTPRequestHandler):
         """, (account_row["id"], batch_name))
         batch_id = cur.lastrowid
 
-        for product_id in product_ids:
+        for item in selected_items:
+            product_ids = item["product_ids"]
+            if len(product_ids) <= 1:
+                cur.execute("""
+                    INSERT INTO xianyu_publish_tasks (
+                        account_id, batch_id, product_id, publish_mode, cover_product_id, status, publish_status
+                    )
+                    VALUES (?, ?, ?, 'single', ?, 'pending', 'pending')
+                """, (account_row["id"], batch_id, int(product_ids[0]), int(product_ids[0])))
+                continue
+
+            group_row = find_group_by_member_ids(product_ids)
+            cover_product_id = int(product_ids[0])
+            group_id = int(group_row["id"]) if group_row else None
+            group_copy = load_group_ai_copy(group_id, account_name=account_name, channel="xianyu") if group_id else None
+            group_ai_title = str((group_copy["ai_title"] if group_copy else "") or "").strip()
+            group_ai_description = str((group_copy["ai_description"] if group_copy else "") or "").strip()
+            cover_image_path = ""
+            selected_group_images = []
+            if group_id and group_id in selected_group_cover_ids:
+                ai_cover_path = Path(build_group_ai_cover_path(group_id, account_name, "xianyu"))
+                if ai_cover_path.exists():
+                    cover_image_path = str(ai_cover_path)
+                    selected_group_images.append({"type": "group_cover", "label": "组封面", "path": cover_image_path})
+            for product_id in product_ids:
+                conn2 = get_conn()
+                product_row = conn2.execute("SELECT COALESCE(color, '') AS color FROM products WHERE id = ? LIMIT 1", (product_id,)).fetchone()
+                conn2.close()
+                color_label = str((product_row["color"] if product_row else "") or "").strip() or f"成员{product_id}"
+                for ai_row in list_ai_images(product_id, account_name=account_name, asset_type="main"):
+                    if int(ai_row.get("is_selected") or 0) != 1:
+                        continue
+                    image_path = str(ai_row.get("ai_main_image_path") or "").strip()
+                    if not image_path:
+                        continue
+                    selected_group_images.append(
+                        {
+                            "type": "member_ai",
+                            "label": color_label,
+                            "path": image_path,
+                            "product_id": int(product_id),
+                            "image_id": int(ai_row.get("id") or 0),
+                        }
+                    )
             cur.execute("""
-                INSERT INTO xianyu_publish_tasks (account_id, batch_id, product_id, status, publish_status)
-                VALUES (?, ?, ?, 'pending', 'pending')
-            """, (account_row["id"], batch_id, int(product_id)))
+                INSERT INTO xianyu_publish_tasks (
+                    account_id,
+                    batch_id,
+                    product_id,
+                    publish_mode,
+                    group_id,
+                    group_member_product_ids,
+                    cover_product_id,
+                    cover_image_path,
+                    ai_title,
+                    ai_description,
+                    selected_group_images_json,
+                    status,
+                    publish_status
+                )
+                VALUES (?, ?, ?, 'group', ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')
+            """, (
+                account_row["id"],
+                batch_id,
+                cover_product_id,
+                group_id,
+                ",".join(str(pid) for pid in product_ids),
+                cover_product_id,
+                cover_image_path,
+                group_ai_title,
+                group_ai_description,
+                json.dumps(selected_group_images, ensure_ascii=False),
+            ))
 
         cur.execute("""
             UPDATE xianyu_publish_batches
@@ -3206,6 +4398,39 @@ class AdminHandler(BaseHTTPRequestHandler):
             "data": result,
         })
 
+    def generate_group_product_ai_copy(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        form = parse_qs(self.rfile.read(length).decode("utf-8"))
+        group_id = (form.get("group_id") or [""])[0].strip()
+        account_name = (form.get("account_name") or [""])[0].strip()
+        channel = (form.get("channel") or ["xianyu"])[0].strip().lower() or "xianyu"
+        mode = (form.get("mode") or ["title"])[0].strip().lower()
+        if not group_id.isdigit() or int(group_id) <= 0:
+            return self.send_json({"ok": False, "message": "缺少有效商品组ID"}, 400)
+        if mode not in ("title", "description", "both"):
+            return self.send_json({"ok": False, "message": "缺少有效生成模式"}, 400)
+        try:
+            title_result = None
+            description_result = None
+            if mode in ("title", "both"):
+                title_result = generate_title_for_group(int(group_id), account_name=account_name, channel=channel)
+            if mode in ("description", "both"):
+                description_result = generate_description_for_group(int(group_id), account_name=account_name, channel=channel)
+        except Exception as e:
+            return self.send_json({"ok": False, "message": str(e)}, 500)
+        payload = {
+            "ok": True,
+            "message": f"组商品AI{'标题' if mode == 'title' else ('简介' if mode == 'description' else '标题和简介')}生成完成",
+            "group_id": int(group_id),
+            "ai_title": (title_result or {}).get("ai_title") or "",
+            "ai_description": (description_result or {}).get("ai_description") or "",
+        }
+        if mode == "both" and not payload["ai_title"] and title_result:
+            payload["ai_title"] = title_result.get("ai_title") or ""
+        if mode == "both" and not payload["ai_description"] and description_result:
+            payload["ai_description"] = description_result.get("ai_description") or ""
+        return self.send_json(payload)
+
     def generate_product_ai_image(self):
         length = int(self.headers.get("Content-Length", "0") or "0")
         form = parse_qs(self.rfile.read(length).decode("utf-8"))
@@ -3239,6 +4464,55 @@ class AdminHandler(BaseHTTPRequestHandler):
             "message": "AI主图任务已提交，后台生成中",
             "job_id": job_id,
             "product_id": int(product_id),
+            "status": "queued",
+        })
+
+    def generate_group_product_ai_image(self):
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        form = parse_qs(self.rfile.read(length).decode("utf-8"))
+        group_id = (form.get("group_id") or [""])[0].strip()
+        account_name = (form.get("account_name") or [""])[0].strip()
+        channel = (form.get("channel") or ["xianyu"])[0].strip().lower()
+        raw_product_ids = (form.get("product_ids") or [""])[0].strip()
+        product_ids = [int(item) for item in raw_product_ids.split(",") if item.strip().isdigit()]
+        if not product_ids:
+            return self.send_json({"ok": False, "message": "缺少有效组内商品ID"}, 400)
+        resolved_group_id = int(group_id) if group_id.isdigit() and int(group_id) > 0 else 0
+        if resolved_group_id <= 0:
+            group_row = find_group_by_member_ids_relaxed(product_ids)
+            if not group_row:
+                refresh_one8_product_groups()
+                group_row = find_group_by_member_ids_relaxed(product_ids)
+            if not group_row:
+                return self.send_json({"ok": False, "message": "找不到商品组，请先刷新 one8 商品组"}, 400)
+            resolved_group_id = int(group_row["id"])
+        job_id = uuid.uuid4().hex
+        now_text = datetime.now().isoformat(timespec="seconds")
+        with AI_IMAGE_JOBS_LOCK:
+            AI_IMAGE_JOBS[job_id] = {
+                "job_id": job_id,
+                "group_id": resolved_group_id,
+                "product_id": int(product_ids[0]),
+                "product_ids": product_ids,
+                "account_name": account_name,
+                "channel": channel,
+                "status": "queued",
+                "message": "组商品AI主图任务已提交，后台生成中",
+                "ai_main_image_path": "",
+                "error": "",
+                "created_at": now_text,
+                "updated_at": now_text,
+            }
+        threading.Thread(
+            target=self._run_group_ai_image_job,
+            args=(job_id, resolved_group_id, product_ids, account_name, channel),
+            daemon=True,
+        ).start()
+        return self.send_json({
+            "ok": True,
+            "message": "组商品AI主图任务已提交，后台生成中",
+            "job_id": job_id,
+            "group_id": resolved_group_id,
             "status": "queued",
         })
 
@@ -3302,6 +4576,89 @@ class AdminHandler(BaseHTTPRequestHandler):
                 if job:
                     job["status"] = "failed"
                     job["asset_type"] = asset_type
+                    job["message"] = str(e)
+                    job["error"] = str(e)
+                    job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    def _run_group_ai_image_job(self, job_id: str, group_id: int, product_ids: list[int], account_name: str, channel: str = "xianyu"):
+        with AI_IMAGE_JOBS_LOCK:
+            job = AI_IMAGE_JOBS.get(job_id)
+            if job:
+                job["status"] = "running"
+                job["message"] = "组商品AI主图后台生成中"
+                job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            conn = get_conn()
+            group_row = conn.execute(
+                "SELECT id, group_name, category FROM product_groups WHERE id = ? LIMIT 1",
+                (group_id,),
+            ).fetchone()
+            member_rows = conn.execute(
+                """
+                SELECT
+                    p.id AS product_id,
+                    COALESCE(p.color, '') AS color
+                FROM product_group_members m
+                JOIN products p
+                  ON p.id = m.product_id
+                WHERE m.group_id = ?
+                ORDER BY m.sort_order, p.id
+                """,
+                (group_id,),
+            ).fetchall()
+            conn.close()
+            if not group_row:
+                raise ValueError(f"找不到商品组: {group_id}")
+
+            image_items = []
+            failures = []
+            generated_count = 0
+            reused_count = 0
+            for member in member_rows:
+                product_id = int(member["product_id"] or 0)
+                if product_id not in product_ids:
+                    continue
+                existing = load_existing_ai_image(product_id, account_name=account_name, asset_type="main")
+                image_path = str(existing["ai_main_image_path"] or "").strip() if existing else ""
+                if image_path and Path(image_path).exists():
+                    reused_count += 1
+                else:
+                    generate_ai_main_image(product_id, force=True, account_name=account_name, channel=channel)
+                    existing = load_existing_ai_image(product_id, account_name=account_name, asset_type="main")
+                    image_path = str(existing["ai_main_image_path"] or "").strip() if existing else ""
+                    if image_path and Path(image_path).exists():
+                        generated_count += 1
+                if not image_path or not Path(image_path).exists():
+                    failures.append(str(product_id))
+                    continue
+                image_items.append({
+                    "ai_image_path": image_path,
+                    "color": str(member["color"] or "").strip(),
+                })
+            if failures:
+                raise ValueError(f"以下商品AI图生成失败或不存在: {', '.join(failures)}")
+            output_path = generate_group_ai_cover_image(
+                source="one8",
+                group_id=group_id,
+                group_name=str(group_row["group_name"] or ""),
+                category=str(group_row["category"] or ""),
+                items=image_items,
+                account_name=account_name,
+                channel=channel,
+                output_name=build_group_ai_cover_output_name(account_name, channel),
+            )
+            with AI_IMAGE_JOBS_LOCK:
+                job = AI_IMAGE_JOBS.get(job_id)
+                if job:
+                    job["status"] = "succeeded"
+                    job["message"] = f"组商品AI主图生成完成（复用{reused_count}，新生成{generated_count}，封面1张）"
+                    job["ai_main_image_path"] = str(output_path)
+                    job["updated_at"] = datetime.now().isoformat(timespec="seconds")
+        except Exception as e:
+            with AI_IMAGE_JOBS_LOCK:
+                job = AI_IMAGE_JOBS.get(job_id)
+                if job:
+                    job["status"] = "failed"
                     job["message"] = str(e)
                     job["error"] = str(e)
                     job["updated_at"] = datetime.now().isoformat(timespec="seconds")
@@ -3938,6 +5295,7 @@ class AdminHandler(BaseHTTPRequestHandler):
         })
 
     def create_batch(self, account_name: str, batch_name: str, product_ids: list[int]) -> int:
+        ensure_xianyu_group_task_support()
         conn = get_conn()
         cur = conn.cursor()
         account_row = cur.execute(

@@ -13,12 +13,14 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlparse, urlunparse
 import pandas as pd
 import requests
 
+from daily_run_tracker import get_env_run_id, get_env_step_key, update_step_progress
 from discount_rules import find_matching_discount_rule, load_discount_rules
 from db_utils import (
     get_latest_update,
     get_product_by_branduid,
     insert_change_log,
     insert_product,
+    mark_product_inactive_by_branduid,
     update_product_basic,
     upsert_product_update,
 )
@@ -767,6 +769,8 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
     stop_category = False
     consecutive_sold_out = 0
     session = requests.Session()
+    run_id = get_env_run_id()
+    step_key = get_env_step_key("one8_list_sync")
 
     while True:
         if remaining_limit is not None and total_count >= remaining_limit:
@@ -774,6 +778,12 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
 
         current_url = make_page_url(category_url, page_num)
         print(f"\n抓取分类 [{category_name}] 第 {page_num} 页")
+        if run_id:
+            update_step_progress(
+                run_id,
+                step_key,
+                message=f"One8 抓取中 | 分类 {category_name} | 第 {page_num} 页 | 累计 {total_count}",
+            )
         if page_num > start_page:
             sleep_between_pages()
         try:
@@ -801,6 +811,10 @@ def crawl_category(category_url: str, category_name: str, remaining_limit=None, 
             if remaining_limit is not None and total_count >= remaining_limit:
                 break
             if item.get("sold_out"):
+                sold_out_href = clean_text(item.get("href") or "")
+                sold_out_branduid, _ = normalize_product_url(sold_out_href)
+                if sold_out_branduid:
+                    mark_product_inactive_by_branduid(SOURCE_NAME, sold_out_branduid)
                 page_skipped += 1
                 consecutive_sold_out += 1
                 if consecutive_sold_out >= 5:
@@ -892,6 +906,10 @@ def main():
     progress = read_progress()
     completed_all = True
     categories_df = pd.read_excel(CATEGORY_FILE)
+    run_id = get_env_run_id()
+    step_key = get_env_step_key("one8_list_sync")
+    if run_id:
+        update_step_progress(run_id, step_key, current=0, total=len(categories_df), message="One8 列表抓取启动")
     progress_start_name = next(iter(progress.keys()), "")
     start_index = 0
     if progress_start_name:
@@ -930,6 +948,14 @@ def main():
             raise
         total_processed += category_total
         print(f"完成分类: {category_name} | 分类新增处理: {category_total} | 累计: {total_processed}")
+        if run_id:
+            update_step_progress(
+                run_id,
+                step_key,
+                current=idx + 1,
+                total=len(categories_df),
+                message=f"One8 分类完成 | {category_name} | 累计 {total_processed}",
+            )
         clear_category_progress(category_name)
         if idx + 1 < len(categories_df):
             sleep_between_categories()
@@ -943,6 +969,14 @@ def main():
         clear_progress()
         exported_count = export_one8_inventory_excel()
         print(f"已导出 one8 库存表: {EXPORT_FILE} | 条数: {exported_count}")
+        if run_id:
+            update_step_progress(
+                run_id,
+                step_key,
+                current=len(categories_df),
+                total=len(categories_df),
+                message=f"One8 列表抓取完成 | 导出 {exported_count} 条",
+            )
     print("\n全部完成")
 
 

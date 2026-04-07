@@ -2,6 +2,7 @@ import sqlite3
 import json
 
 import pandas as pd
+from xianyu_open.stock_utils import parse_total_stock
 
 
 DB_FILE = "products.db"
@@ -9,6 +10,72 @@ DB_FILE = "products.db"
 
 def get_connection():
     return sqlite3.connect(DB_FILE)
+
+
+def load_hot_metrics_df(sources: tuple[str, ...] | None = None) -> pd.DataFrame:
+    normalized_sources = tuple(source for source in (sources or ("boardline", "one8")) if str(source or "").strip())
+    if not normalized_sources:
+        normalized_sources = ("boardline", "one8")
+    conn = get_connection()
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in normalized_sources)
+    rows = conn.execute(
+        f"""
+        SELECT
+            c.product_id,
+            c.old_value,
+            c.new_value
+        FROM change_logs c
+        JOIN products p
+          ON p.id = c.product_id
+        WHERE c.field_name = 'stock'
+          AND p.source IN ({placeholders})
+        ORDER BY c.change_time ASC, c.id ASC
+        """,
+        normalized_sources,
+    ).fetchall()
+    conn.close()
+
+    metrics: dict[int, dict] = {}
+    for row in rows:
+        product_id = int(row["product_id"])
+        old_total = parse_total_stock(row["old_value"])
+        new_total = parse_total_stock(row["new_value"])
+        if new_total >= old_total:
+            continue
+        sold_units = old_total - new_total
+        if sold_units <= 0:
+            continue
+        item = metrics.setdefault(product_id, {"drop_events": 0, "sold_units": 0, "raw_score": 0})
+        item["drop_events"] += 1
+        item["sold_units"] += sold_units
+
+    ranked_rows = []
+    for product_id, item in metrics.items():
+        raw_score = int(item["sold_units"]) * 10 + int(item["drop_events"]) * 5
+        if raw_score <= 0:
+            continue
+        ranked_rows.append({
+            "product_id": int(product_id),
+            "drop_events": int(item["drop_events"]),
+            "sold_units": int(item["sold_units"]),
+            "raw_score": int(raw_score),
+        })
+
+    if not ranked_rows:
+        return pd.DataFrame(columns=["product_id", "hot_index", "hot_rank", "stock_drop_events", "stock_sold_units"])
+
+    ranked_rows.sort(key=lambda item: (-item["raw_score"], -item["sold_units"], -item["drop_events"], item["product_id"]))
+    max_raw = int(ranked_rows[0]["raw_score"])
+
+    for index, item in enumerate(ranked_rows, start=1):
+        item["hot_index"] = int(round(item["raw_score"] * 100 / max_raw)) if max_raw > 0 else 0
+        item["hot_rank"] = index
+        item["stock_drop_events"] = item.pop("drop_events")
+        item["stock_sold_units"] = item.pop("sold_units")
+        item.pop("raw_score", None)
+
+    return pd.DataFrame(ranked_rows)
 
 
 def ensure_ai_image_table():
@@ -191,6 +258,11 @@ def load_task_details(account_name: str = "") -> pd.DataFrame:
             b.batch_name,
             b.status AS batch_status,
             t.id AS task_id,
+            COALESCE(t.publish_mode, 'single') AS publish_mode,
+            t.group_id,
+            COALESCE(t.group_member_product_ids, '') AS group_member_product_ids,
+            COALESCE(t.cover_image_path, '') AS cover_image_path,
+            COALESCE(t.selected_group_images_json, '') AS selected_group_images_json,
             t.status,
             t.publish_status,
             t.callback_status,
@@ -283,8 +355,10 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
             a.account_name,
             p.id AS product_id,
             p.branduid,
+            p.source,
             p.category,
             p.name,
+            COALESCE(p.color, '') AS color,
             p.first_seen,
             p.image_url,
             u.final_price_cny,
@@ -337,8 +411,10 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
             a.id,
             p.id,
             p.branduid,
+            p.source,
             p.category,
             p.name,
+            p.color,
             p.first_seen,
             p.image_url,
             u.final_price_cny,
@@ -361,11 +437,14 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
         ORDER BY id DESC
     """, conn, params=[account_name])
     conn.close()
+    hot_df = load_hot_metrics_df()
 
     ai_map = _build_ai_image_map(ai_rows)
 
     if not df.empty:
         df = df.copy()
+        if not hot_df.empty:
+            df = df.merge(hot_df, on="product_id", how="left")
         df["ai_images_json"] = df["product_id"].apply(lambda pid: json.dumps(ai_map.get(int(pid), []), ensure_ascii=False))
         df["ai_main_image_path"] = df["product_id"].apply(
             lambda pid: (ai_map.get(int(pid), [{}])[0].get("path", "") if ai_map.get(int(pid)) else "")
@@ -373,6 +452,10 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
     else:
         df["ai_images_json"] = []
         df["ai_main_image_path"] = []
+    for column in ("hot_index", "hot_rank", "stock_drop_events", "stock_sold_units"):
+        if column not in df.columns:
+            df[column] = 0
+        df[column] = df[column].fillna(0).astype(int)
     return df
 
 

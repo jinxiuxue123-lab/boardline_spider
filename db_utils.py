@@ -391,6 +391,22 @@ def mark_inactive_products(days_threshold: int = 3, source: Optional[str] = None
     conn.close()
 
 
+def mark_product_inactive_by_branduid(source: str, branduid: str):
+    conn = get_connection()
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        UPDATE products
+        SET status = 'inactive',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE source = ?
+          AND branduid = ?
+    """, (source, branduid))
+
+    conn.commit()
+    conn.close()
+
+
 def delete_product_by_id(product_id: int):
     conn = get_connection()
     cursor = conn.cursor()

@@ -11,19 +11,24 @@ if str(ROOT_DIR) not in sys.path:
 
 from xianyu_open import XianyuOpenClient
 from xianyu_open.payload_builder import build_edit_payload, get_publish_task, load_publish_defaults
+from product_grouping import ensure_xianyu_group_task_support
 
 
 DB_FILE = "products.db"
 
 
 def get_changed_task_ids(today: str, source: str = "") -> list[int]:
+    ensure_xianyu_group_task_support()
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     sql = """
         SELECT DISTINCT t.id AS task_id
         FROM change_logs c
         JOIN xianyu_publish_tasks t
-          ON t.product_id = c.product_id
+          ON (
+            t.product_id = c.product_id
+            OR instr(',' || COALESCE(t.group_member_product_ids, '') || ',', ',' || CAST(c.product_id AS TEXT) || ',') > 0
+          )
         JOIN products p
           ON p.id = t.product_id
         WHERE c.field_name = 'stock'

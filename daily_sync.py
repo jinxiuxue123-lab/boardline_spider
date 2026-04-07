@@ -5,6 +5,7 @@ from datetime import datetime
 import sqlite3
 from pathlib import Path
 
+from daily_run_tracker import finish_step, get_env_run_id, start_step, update_run
 from db_utils import (
     increment_missing_days_for_not_seen_today,
     reset_missing_days_for_seen_today,
@@ -146,6 +147,10 @@ def main():
     today = datetime.now().strftime("%Y-%m-%d")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = LOG_DIR / f"daily_sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    run_id = get_env_run_id()
+
+    if run_id:
+        update_run(run_id, log_file=str(log_path))
 
     with open(log_path, "w", encoding="utf-8") as log_file:
         log("开始每日同步流程...", log_file)
@@ -153,33 +158,63 @@ def main():
         log(f"日志文件: {log_path}", log_file)
 
         log_step("1/8", "巡检新增商品", log_file)
+        if run_id:
+            start_step(run_id, "boardline_check_new", "巡检新增商品")
         run_script("check_new_products.py", log_file, continue_on_error=True)
+        if run_id:
+            finish_step(run_id, "boardline_check_new", "success", "巡检完成")
 
         log_step("2/8", "同步 Boardline 商品列表", log_file)
+        if run_id:
+            start_step(run_id, "boardline_list_sync", "同步 Boardline 商品列表")
         run_script("spider_list_db.py", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_list_sync", "success", "列表同步完成")
 
         log_step("3/8", "处理商品上下架状态", log_file)
+        if run_id:
+            start_step(run_id, "boardline_status_sync", "处理商品上下架状态")
 
         reset_missing_days_for_seen_today(SOURCE_NAME, today)
         increment_missing_days_for_not_seen_today(SOURCE_NAME, today)
         mark_inactive_products(days_threshold=INACTIVE_DAYS, source=SOURCE_NAME)
         log("商品上下架状态处理完成", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_status_sync", "success", "上下架状态处理完成")
 
         log_step("4/8", "抓取库存和价格变动", log_file)
+        if run_id:
+            start_step(run_id, "boardline_detail_update", "抓取库存和价格变动")
         run_script("update_stock_db_concurrent.py", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_detail_update", "success", "详情库存更新完成")
 
         log_step("5/8", "同步闲鱼上下架与库存", log_file)
+        if run_id:
+            start_step(run_id, "boardline_xianyu_sync", "同步闲鱼上下架与库存")
         run_script("scripts/auto_downshelf_zero_stock.py", log_file)
         run_script("scripts/sync_xianyu_stock_changes.py --source boardline", log_file)
         run_script("scripts/auto_reshelf_recovered_stock.py", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_xianyu_sync", "success", "闲鱼上下架与库存同步完成")
 
         log_step("6/8", "导出今日变化表", log_file)
+        if run_id:
+            start_step(run_id, "boardline_export_changes", "导出今日变化表")
         run_script("export_changes.py", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_export_changes", "success", "变化表导出完成")
 
         log_step("7/8", "导出今日新增商品", log_file)
+        if run_id:
+            start_step(run_id, "boardline_export_new_products", "导出今日新增商品")
         run_script("export_new_products.py", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_export_new_products", "success", "新增商品导出完成")
 
         log_step("8/8", "汇总统计", log_file)
+        if run_id:
+            start_step(run_id, "boardline_summary", "汇总统计")
         summary = get_daily_summary(today)
 
         log("\n每日同步完成", log_file)
@@ -193,6 +228,8 @@ def main():
         log(f"闲鱼自动重新上架数: {summary['reshelved_count']}", log_file)
         log(f"失败列表分页数: {summary['failed_list_pages_count']}", log_file)
         log(f"失败详情页数: {summary['failed_stock_urls_count']}", log_file)
+        if run_id:
+            finish_step(run_id, "boardline_summary", "success", "汇总统计完成")
 
 
 if __name__ == "__main__":

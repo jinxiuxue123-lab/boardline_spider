@@ -5,6 +5,7 @@ import sqlite3
 
 from .image_pipeline import build_hosted_image_url
 from .stock_utils import parse_total_stock
+from product_grouping import ensure_xianyu_group_task_support
 
 DB_FILE = "products.db"
 DEFAULT_SHIPPING_REGION_GROUP_SIZE = 10
@@ -90,6 +91,7 @@ def get_category_mapping(category: str) -> dict:
 
 def get_publish_task(task_id: int) -> dict:
     ensure_account_ai_copy_support()
+    ensure_xianyu_group_task_support()
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     cur = conn.cursor()
@@ -97,6 +99,11 @@ def get_publish_task(task_id: int) -> dict:
         SELECT
             t.id,
             t.product_id,
+            COALESCE(t.publish_mode, 'single') AS publish_mode,
+            t.group_id,
+            COALESCE(t.group_member_product_ids, '') AS group_member_product_ids,
+            COALESCE(t.cover_product_id, t.product_id) AS cover_product_id,
+            COALESCE(t.selected_group_images_json, '') AS selected_group_images_json,
             t.third_product_id,
             t.ai_title,
             t.ai_description,
@@ -154,10 +161,113 @@ def get_publish_task(task_id: int) -> dict:
         WHERE t.id = ?
     """, (task_id,))
     row = cur.fetchone()
-    conn.close()
     if not row:
+        conn.close()
         raise ValueError(f"找不到发布任务: {task_id}")
-    return dict(row)
+    task = dict(row)
+
+    member_ids = [int(item.strip()) for item in str(task.get("group_member_product_ids") or "").split(",") if item.strip().isdigit()]
+    if str(task.get("publish_mode") or "single").strip() == "group" and member_ids:
+        placeholders = ",".join("?" for _ in member_ids)
+        member_rows = conn.execute(
+            f"""
+            SELECT
+                p.id AS product_id,
+                p.branduid,
+                p.category,
+                p.name,
+                COALESCE(p.color, '') AS color,
+                COALESCE(p.local_image_path, '') AS local_image_path,
+                COALESCE(p.image_url, '') AS image_url,
+                COALESCE(u.stock, '') AS stock,
+                COALESCE(u.price_cny, '') AS price_cny,
+                COALESCE(u.final_price_cny, '') AS final_price_cny,
+                COALESCE(u.original_price_cny, '') AS original_price_cny,
+                COALESCE(u.latest_discount_price, '') AS latest_discount_price,
+                COALESCE(u.price, '') AS price,
+                COALESCE(u.original_price, '') AS original_price
+            FROM products p
+            LEFT JOIN product_updates u
+              ON u.product_id = p.id
+            WHERE p.id IN ({placeholders})
+            ORDER BY p.id
+            """,
+            member_ids,
+        ).fetchall()
+        members = [dict(item) for item in member_rows]
+        task["group_members"] = members
+        task["stock"] = build_group_stock_summary(members)
+        task["branduid"] = f"group-{task.get('group_id') or task_id}"
+        task.update({key: value for key, value in resolve_group_price_fields(task).items() if value})
+    conn.close()
+    return task
+
+
+def build_group_stock_summary(group_members: list[dict]) -> str:
+    parts = []
+    for item in group_members:
+        color = normalize_price_text(item.get("color"))
+        stock_text = normalize_price_text(item.get("stock"))
+        total_stock = parse_total_stock(stock_text)
+        if not color:
+            color = f"商品{item.get('product_id')}"
+        if total_stock > 0:
+            parts.append(f"{color}:{total_stock}")
+    return " | ".join(parts)
+
+
+def _parse_price_int(value) -> int | None:
+    text = normalize_price_text(value)
+    if not text:
+        return None
+    cleaned = (
+        text.replace(",", "")
+        .replace(" ", "")
+        .replace("元", "")
+        .replace("￥", "")
+        .replace("¥", "")
+        .replace("원", "")
+    )
+    try:
+        number = float(cleaned)
+    except Exception:
+        return None
+    if number <= 0:
+        return None
+    return int(round(number))
+
+
+def resolve_group_price_fields(task: dict) -> dict:
+    members = task.get("group_members") or []
+    resolved = {
+        "publish_price": normalize_price_text(task.get("publish_price")),
+        "final_price_cny": normalize_price_text(task.get("final_price_cny")),
+        "original_price_cny": normalize_price_text(task.get("original_price_cny")),
+    }
+
+    def pick_max(field_names: list[str]) -> str:
+        values: list[int] = []
+        for item in members:
+            for field_name in field_names:
+                parsed = _parse_price_int(item.get(field_name))
+                if parsed is not None:
+                    values.append(parsed)
+                    break
+        if not values:
+            return ""
+        return str(max(values))
+
+    if not resolved["publish_price"]:
+        resolved["publish_price"] = pick_max(["final_price_cny", "price_cny"])
+    if not resolved["final_price_cny"]:
+        resolved["final_price_cny"] = pick_max(["final_price_cny", "price_cny"]) or resolved["publish_price"]
+    if not resolved["original_price_cny"]:
+        resolved["original_price_cny"] = (
+            pick_max(["original_price_cny", "price_cny", "final_price_cny"])
+            or resolved["final_price_cny"]
+            or resolved["publish_price"]
+        )
+    return resolved
 
 
 def load_product_channel_pv(product_id: int) -> list[dict]:
@@ -182,6 +292,132 @@ def load_product_channel_pv(product_id: int) -> list[dict]:
         for row in rows
         if (row["property_id"] or "").strip() and (row["value_name"] or "").strip()
     ]
+
+
+def _normalize_brand_token(text: str) -> str:
+    text = normalize_price_text(text).lower()
+    text = re.sub(r"[^a-z0-9]+", "", text)
+    return text
+
+
+def _extract_brand_keyword(name: str) -> str:
+    text = normalize_price_text(name)
+    text = re.sub(r"^\d{2,4}\s*", "", text).strip()
+    if not text:
+        return ""
+    return text.split()[0].strip()
+
+
+def infer_fallback_channel_pv(task: dict) -> list[dict]:
+    category = normalize_price_text(task.get("category"))
+    name = normalize_price_text(task.get("name"))
+    conn = sqlite3.connect(DB_FILE)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        """
+        SELECT
+            p.category,
+            v.property_id,
+            v.property_name,
+            v.value_id,
+            v.value_name,
+            COUNT(*) AS cnt
+        FROM xianyu_product_property_values v
+        JOIN products p
+          ON p.id = v.product_id
+        WHERE p.category = ?
+        GROUP BY p.category, v.property_id, v.property_name, v.value_id, v.value_name
+        ORDER BY v.property_name, cnt DESC
+        """,
+        (category,),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return []
+
+    property_options: dict[str, list[dict]] = {}
+    for row in rows:
+        property_name = normalize_price_text(row["property_name"])
+        if not property_name:
+            continue
+        property_options.setdefault(property_name, []).append(
+            {
+                "property_id": normalize_price_text(row["property_id"]),
+                "property_name": property_name,
+                "value_id": normalize_price_text(row["value_id"]),
+                "value_name": normalize_price_text(row["value_name"]),
+                "cnt": int(row["cnt"] or 0),
+            }
+        )
+
+    def pick(property_name: str, preferred_value: str = "") -> dict | None:
+        options = property_options.get(property_name) or []
+        if not options:
+            return None
+        preferred_token = _normalize_brand_token(preferred_value)
+        if preferred_token:
+            for option in options:
+                option_token = _normalize_brand_token(option["value_name"])
+                if option_token == preferred_token or preferred_token in option_token or option_token in preferred_token:
+                    return option
+        return options[0]
+
+    fallback_rows: list[dict] = []
+    seen_props = set()
+
+    def append_option(option: dict | None):
+        if not option:
+            return
+        key = normalize_price_text(option["property_name"])
+        if not key or key in seen_props:
+            return
+        seen_props.add(key)
+        fallback_rows.append(
+            {
+                "property_id": option["property_id"],
+                "property_name": option["property_name"],
+                "value_id": option["value_id"],
+                "value_name": option["value_name"],
+            }
+        )
+
+    brand_keyword = _extract_brand_keyword(name)
+
+    if category == "固定器":
+        append_option(pick("品牌", brand_keyword))
+        append_option(pick("成色", "全新"))
+        append_option(pick("滑雪板类型", "单板"))
+        append_option(pick("适用性别", "中性"))
+        wear_style = "快穿" if any(token in name.upper() for token in ("STEP ON", "SUPERMATIC", "CLEW")) else "传统式"
+        append_option(pick("固定器穿脱方式", wear_style))
+        append_option(pick("适用对象", "通用"))
+        return fallback_rows
+
+    if category == "滑雪鞋":
+        append_option(pick("品牌", brand_keyword))
+        append_option(pick("成色", "全新"))
+        append_option(pick("适用对象", "中性"))
+        return fallback_rows
+
+    if category == "滑雪板":
+        append_option(pick("品牌", brand_keyword))
+        append_option(pick("成色", "全新"))
+        append_option(pick("滑雪板类型", "单板"))
+        append_option(pick("适用对象", "通用"))
+        return fallback_rows
+
+    return []
+
+
+def load_group_member_channel_pv(task: dict) -> list[dict]:
+    for member in task.get("group_members") or []:
+        member_id = int(member.get("product_id") or 0)
+        if member_id <= 0:
+            continue
+        member_pv = load_product_channel_pv(member_id)
+        if member_pv:
+            return member_pv
+    return []
 
 
 def load_product_publish_meta(product_id: int) -> dict:
@@ -228,6 +464,28 @@ def collect_publish_images(task: dict, upload_watermark: bool = False) -> list[s
     account_name = normalize_price_text(task.get("account_name"))
     product_id = int(task.get("product_id") or 0)
     watermark_text = account_name if upload_watermark else ""
+    publish_mode = normalize_price_text(task.get("publish_mode")) or "single"
+    selected_group_images_json = normalize_price_text(task.get("selected_group_images_json"))
+
+    if publish_mode == "group" and selected_group_images_json:
+        try:
+            selected_group_images = json.loads(selected_group_images_json)
+        except Exception:
+            selected_group_images = []
+        for item in selected_group_images if isinstance(selected_group_images, list) else []:
+            if not isinstance(item, dict):
+                continue
+            image_path = normalize_price_text(item.get("path"))
+            if not image_path:
+                continue
+            if is_remote_url(image_path):
+                image_candidates.append(image_path)
+                continue
+            hosted_image = build_hosted_image_url(image_path, watermark_text=watermark_text)
+            if hosted_image:
+                image_candidates.append(hosted_image)
+        if image_candidates:
+            return list(dict.fromkeys(image_candidates))
 
     ai_rows = load_account_ai_images(product_id, account_name) if product_id else []
     selected_rows = [row for row in ai_rows if int(row.get("is_selected") or 0) == 1]
@@ -245,9 +503,9 @@ def collect_publish_images(task: dict, upload_watermark: bool = False) -> list[s
         elif ai_path:
             missing_hostable_ai.append(ai_path)
 
-    if image_candidates:
+    if image_candidates and publish_mode != "group":
         return list(dict.fromkeys(image_candidates))
-    if active_ai_rows and missing_hostable_ai:
+    if active_ai_rows and missing_hostable_ai and publish_mode != "group":
         raise ValueError(
             "当前商品已选择 AI 图片，但这些图片没有可上传的公网地址。"
             "请先配置 PUBLIC_MEDIA_BASE_URL 或 XIANYU_IMAGE_CDN_BASE_URL，"
@@ -259,7 +517,48 @@ def collect_publish_images(task: dict, upload_watermark: bool = False) -> list[s
     if task_cover_path and not is_remote_url(task_cover_path):
         hosted_cover = build_hosted_image_url(task_cover_path, watermark_text=watermark_text)
     if hosted_cover:
-        return [hosted_cover]
+        image_candidates.append(hosted_cover)
+    elif task_cover_path and is_remote_url(task_cover_path):
+        image_candidates.append(task_cover_path)
+
+    if publish_mode == "group":
+        any_member_selected = any(
+            int(row.get("is_selected") or 0) == 1
+            for item in task.get("group_members") or []
+            for row in load_account_ai_images(int(item.get("product_id") or 0), account_name) if int(item.get("product_id") or 0) > 0
+        )
+        for item in task.get("group_members") or []:
+            member_id = int(item.get("product_id") or 0)
+            member_ai_rows = load_account_ai_images(member_id, account_name) if member_id else []
+            member_selected_rows = [row for row in member_ai_rows if int(row.get("is_selected") or 0) == 1]
+            member_active_rows = member_selected_rows if any_member_selected else (member_selected_rows or member_ai_rows)
+            member_added = False
+            for row in member_active_rows:
+                oss_url = normalize_price_text(row.get("oss_url"))
+                if oss_url and is_remote_url(oss_url) and not watermark_text:
+                    image_candidates.append(oss_url)
+                    member_added = True
+                    continue
+                ai_path = normalize_price_text(row.get("ai_main_image_path"))
+                hosted_ai = build_hosted_image_url(ai_path, watermark_text=watermark_text) if ai_path else ""
+                if hosted_ai:
+                    image_candidates.append(hosted_ai)
+                    member_added = True
+                    continue
+            if member_added:
+                continue
+            if any_member_selected:
+                continue
+            member_local_path = normalize_price_text(item.get("local_image_path"))
+            hosted_local = build_hosted_image_url(member_local_path, watermark_text=watermark_text) if member_local_path else ""
+            if hosted_local:
+                image_candidates.append(hosted_local)
+                continue
+            member_image_url = normalize_price_text(item.get("image_url"))
+            if member_image_url and is_remote_url(member_image_url):
+                image_candidates.append(member_image_url)
+        if image_candidates:
+            return list(dict.fromkeys(image_candidates))
 
     local_path = normalize_price_text(task.get("local_image_path"))
     hosted_local = build_hosted_image_url(local_path, watermark_text=watermark_text) if local_path else ""
@@ -371,6 +670,7 @@ def build_template_title(task: dict, property_map: dict[str, str]) -> str:
 def build_default_description(task: dict, product_channel_pv: list[dict]) -> str:
     category = normalize_price_text(task.get("category"))
     name = normalize_price_text(task.get("name"))
+    publish_mode = normalize_price_text(task.get("publish_mode")) or "single"
     property_map = build_property_map(product_channel_pv)
     lines = []
 
@@ -400,7 +700,14 @@ def build_default_description(task: dict, product_channel_pv: list[dict]) -> str
 
     stock = normalize_price_text(task.get("stock"))
     if stock:
-        lines.append(f"库存：{stock}")
+        if publish_mode == "group":
+            lines.append("可选颜色及库存：")
+            for chunk in stock.split("|"):
+                text = normalize_price_text(chunk)
+                if text:
+                    lines.append(f"- {text}")
+        else:
+            lines.append(f"库存：{stock}")
 
     if name and name != title_seed:
         lines.append(f"原始款名：{name}")
@@ -459,6 +766,42 @@ def sanitize_sku_value(value: str) -> str:
     return text
 
 
+def resolve_sku_spec_names(task: dict) -> tuple[str, str]:
+    category = normalize_price_text(task.get("category"))
+    if normalize_price_text(task.get("publish_mode")) == "group":
+        if category == "滑雪鞋":
+            return "颜色", "鞋码"
+        if category == "滑雪板":
+            return "颜色", "长度"
+        return "颜色", "规格"
+    if category == "滑雪板":
+        return "长度", ""
+    if category == "滑雪鞋":
+        return "鞋码", ""
+    return "规格", ""
+
+
+def build_group_variant_rows(task: dict) -> list[tuple[str, str, int]]:
+    variants: list[tuple[str, str, int]] = []
+    for member in task.get("group_members") or []:
+        color = trim_xianyu_sku_value(sanitize_sku_value(member.get("color") or ""), max_units=20)
+        if not color:
+            color = f"商品{int(member.get('product_id') or 0)}"
+        member_entries = parse_stock_entries_all(member.get("stock"))
+        positive_entries = [(sku_value, qty) for sku_value, qty in member_entries if int(qty) > 0]
+        if not positive_entries:
+            continue
+        if len(positive_entries) == 1:
+            sku_value, qty = positive_entries[0]
+            size_value = trim_xianyu_sku_value(sanitize_sku_value(sku_value), max_units=20)
+            variants.append((color, size_value, int(qty)))
+            continue
+        for sku_value, qty in positive_entries:
+            size_value = trim_xianyu_sku_value(sanitize_sku_value(sku_value), max_units=20)
+            variants.append((color, size_value, int(qty)))
+    return variants
+
+
 def trim_xianyu_sku_value(value: str, max_units: int = 20) -> str:
     trimmed = normalize_price_text(value)
     if not trimmed:
@@ -475,19 +818,47 @@ def trim_xianyu_sku_value(value: str, max_units: int = 20) -> str:
 
 
 def build_sku_items(task: dict, price_value: int) -> tuple[list[dict], int]:
+    if normalize_price_text(task.get("publish_mode")) == "group":
+        spec_name, sub_spec_name = resolve_sku_spec_names(task)
+        variant_rows = build_group_variant_rows(task)
+        if len(variant_rows) <= 1:
+            total_stock = sum(int(qty) for _, _, qty in variant_rows)
+            return [], total_stock
+
+        sku_items = []
+        seen_values = set()
+        total_stock = 0
+        for color_value, sub_value, qty in variant_rows:
+            parts = [f"{spec_name}:{color_value}"]
+            outer_parts = [color_value]
+            if sub_value:
+                parts.append(f"{sub_spec_name}:{sub_value}")
+                outer_parts.append(sub_value)
+            sku_text = ";".join(parts)
+            dedupe_key = tuple(outer_parts)
+            if dedupe_key in seen_values:
+                continue
+            seen_values.add(dedupe_key)
+            qty = int(qty)
+            total_stock += qty
+            sku_items.append({
+                "price": price_value,
+                "stock": qty,
+                "outer_id": f"{task.get('branduid')}-{'-'.join(outer_parts)}",
+                "sku_text": sku_text,
+            })
+
+        if len(sku_items) <= 1:
+            return [], total_stock
+        return sku_items, total_stock
+
     entries = parse_stock_entries_all(task.get("stock"))
     positive_entries = [(sku_value, qty) for sku_value, qty in entries if int(qty) > 0]
     if len(positive_entries) <= 1:
         total_stock = sum(int(qty) for _, qty in positive_entries)
         return [], total_stock
 
-    category = normalize_price_text(task.get("category"))
-    if category == "滑雪板":
-        spec_name = "长度"
-    elif category == "滑雪鞋":
-        spec_name = "鞋码"
-    else:
-        spec_name = "规格"
+    spec_name, _ = resolve_sku_spec_names(task)
 
     sku_items = []
     seen_values = set()
@@ -515,6 +886,72 @@ def build_sku_items(task: dict, price_value: int) -> tuple[list[dict], int]:
 
 
 def build_edit_sku_items(task: dict, existing_payload: dict | None = None) -> tuple[list[dict], int]:
+    if normalize_price_text(task.get("publish_mode")) == "group":
+        variant_rows = build_group_variant_rows(task)
+        if len(variant_rows) <= 1:
+            total_stock = sum(int(qty) for _, _, qty in variant_rows)
+            return [], total_stock
+
+        spec_name, sub_spec_name = resolve_sku_spec_names(task)
+        current_qty_map: dict[tuple[str, str], int] = {}
+        for color_value, sub_value, qty in variant_rows:
+            current_qty_map[(color_value, sub_value)] = int(qty)
+        if not current_qty_map:
+            return [], 0
+
+        existing_payload = existing_payload or {}
+        existing_sku_items = existing_payload.get("sku_items") or []
+        default_price = int(existing_payload.get("price") or 0)
+        sku_items = []
+        used_values = set()
+
+        for item in existing_sku_items if isinstance(existing_sku_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            sku_text = normalize_price_text(item.get("sku_text"))
+            if not sku_text:
+                continue
+            color_value = ""
+            sub_value = ""
+            for segment in [part.strip() for part in sku_text.split(";") if part.strip()]:
+                if ":" not in segment:
+                    continue
+                label, raw_value = segment.split(":", 1)
+                label = normalize_price_text(label)
+                value = trim_xianyu_sku_value(sanitize_sku_value(raw_value), max_units=20)
+                if label == spec_name:
+                    color_value = value
+                elif sub_spec_name and label == sub_spec_name:
+                    sub_value = value
+            if not color_value:
+                continue
+            key = (color_value, sub_value)
+            used_values.add(key)
+            sku_items.append({
+                "price": int(item.get("price") or default_price or 1),
+                "stock": int(current_qty_map.get(key, 0)),
+                "outer_id": normalize_price_text(item.get("outer_id")) or f"{task.get('branduid')}-{'-'.join(part for part in key if part)}",
+                "sku_text": ";".join(
+                    [f"{spec_name}:{color_value}"] + ([f"{sub_spec_name}:{sub_value}"] if sub_value else [])
+                ),
+            })
+
+        for key, qty in current_qty_map.items():
+            if key in used_values:
+                continue
+            color_value, sub_value = key
+            sku_items.append({
+                "price": default_price or 1,
+                "stock": int(qty),
+                "outer_id": f"{task.get('branduid')}-{'-'.join(part for part in key if part)}",
+                "sku_text": ";".join(
+                    [f"{spec_name}:{color_value}"] + ([f"{sub_spec_name}:{sub_value}"] if sub_value else [])
+                ),
+            })
+
+        total_stock = sum(int(item.get("stock") or 0) for item in sku_items)
+        return sku_items, total_stock
+
     stock_entries = parse_stock_entries_all(task.get("stock"))
     if len(stock_entries) <= 1:
         total_stock = sum(qty for _, qty in stock_entries)
@@ -555,13 +992,7 @@ def build_edit_sku_items(task: dict, existing_payload: dict | None = None) -> tu
         })
 
     if not sku_items:
-        category = normalize_price_text(task.get("category"))
-        if category == "滑雪板":
-            spec_name = "长度"
-        elif category == "滑雪鞋":
-            spec_name = "鞋码"
-        else:
-            spec_name = "规格"
+        spec_name, _ = resolve_sku_spec_names(task)
         for value, qty in current_qty_map.items():
             sku_items.append({
                 "price": default_price or 1,
@@ -574,11 +1005,12 @@ def build_edit_sku_items(task: dict, existing_payload: dict | None = None) -> tu
     for value, qty in current_qty_map.items():
         if value in used_values:
             continue
+        spec_name, _ = resolve_sku_spec_names(task)
         sku_items.append({
             "price": default_price or 1,
             "stock": int(qty),
             "outer_id": f"{task.get('branduid')}-{value}",
-            "sku_text": f"规格:{value}",
+            "sku_text": f"{spec_name}:{value}",
         })
 
     total_stock = sum(int(item.get("stock") or 0) for item in sku_items)
@@ -631,6 +1063,9 @@ def build_create_payload(
     upload_watermark: bool = False,
     shipping_region_override: dict | None = None,
 ) -> dict:
+    publish_mode = normalize_price_text(task.get("publish_mode")) or "single"
+    if publish_mode == "group":
+        task.update({key: value for key, value in resolve_group_price_fields(task).items() if value})
     publish_price = task.get("publish_price") or task.get("final_price_cny") or ""
     if publish_price in (None, ""):
         raise ValueError("缺少发布价格，请先确认 final_price_cny 或 publish_price")
@@ -656,6 +1091,10 @@ def build_create_payload(
         channel_pv_payload = product_channel_pv
     else:
         channel_pv_payload = json.loads(channel_pv)
+    if not channel_pv_payload and publish_mode == "group":
+        channel_pv_payload = load_group_member_channel_pv(task)
+    if not channel_pv_payload:
+        channel_pv_payload = infer_fallback_channel_pv(task)
     property_map = build_property_map(channel_pv_payload)
     template_title = build_template_title(task, property_map)
     title = trim_xianyu_title(task.get("ai_title") or task.get("product_ai_title") or template_title or task.get("name") or "")
@@ -679,7 +1118,11 @@ def build_create_payload(
         "price": price_value,
         "original_price": normalize_price_number(original_price),
         "stock": total_stock,
-        "outer_id": str(task.get("branduid") or task.get("product_id")),
+        "outer_id": (
+            f"group-{int(task.get('group_id') or 0)}"
+            if publish_mode == "group" and int(task.get("group_id") or 0) > 0
+            else str(task.get("branduid") or task.get("product_id"))
+        ),
         "stuff_status": int(stuff_status_value),
         "publish_shop": [
             {
