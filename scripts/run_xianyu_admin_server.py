@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 import threading
 import traceback
@@ -94,12 +95,45 @@ DELETE_BATCH_JOBS_LOCK = threading.Lock()
 BEIJING_TZ = timezone(timedelta(hours=8))
 TAOBAO_OAUTH_AUTHORIZE_URL = os.getenv("TAOBAO_OAUTH_AUTHORIZE_URL", "https://oauth.taobao.com/authorize")
 TAOBAO_OAUTH_TOKEN_URL = os.getenv("TAOBAO_OAUTH_TOKEN_URL", "https://oauth.taobao.com/token")
+AI_SYNC_AUTO_PUSH = str(os.getenv("AI_SYNC_AUTO_PUSH") or "").strip().lower() in ("1", "true", "yes", "on")
 
 
 def get_conn():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def schedule_ai_image_metadata_sync(account_name: str = ""):
+    if not AI_SYNC_AUTO_PUSH:
+        return
+    script_path = ROOT_DIR / "scripts" / "push_ai_image_records_to_server.sh"
+    if not script_path.exists():
+        print(f"[ai-sync] 跳过自动推送：未找到脚本 {script_path}")
+        return
+
+    def _worker():
+        cmd = ["bash", str(script_path)]
+        normalized_account = str(account_name or "").strip()
+        if normalized_account:
+            cmd.extend(["--account-name", normalized_account])
+        try:
+            completed = subprocess.run(
+                cmd,
+                cwd=str(ROOT_DIR),
+                capture_output=True,
+                text=True,
+                timeout=600,
+                check=False,
+            )
+            if completed.returncode != 0:
+                print(f"[ai-sync] 自动推送失败 account={normalized_account or '<shared>'} code={completed.returncode} stderr={completed.stderr.strip()[:1000]}")
+            else:
+                print(f"[ai-sync] 自动推送完成 account={normalized_account or '<shared>'} stdout={completed.stdout.strip()[:1000]}")
+        except Exception as exc:
+            print(f"[ai-sync] 自动推送异常 account={normalized_account or '<shared>'}: {exc}")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def build_group_ai_cover_output_name(account_name: str = "", channel: str = "xianyu") -> str:
@@ -4759,6 +4793,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 job["updated_at"] = datetime.now().isoformat(timespec="seconds")
         try:
             result = generate_ai_detail_image(product_id, force=True, account_name=account_name, channel=channel) if asset_type == "detail" else generate_ai_main_image(product_id, force=True, account_name=account_name, channel=channel)
+            if str(channel or "").strip().lower() == "taobao":
+                schedule_ai_image_metadata_sync(account_name)
             with AI_IMAGE_JOBS_LOCK:
                 job = AI_IMAGE_JOBS.get(job_id)
                 if job:
@@ -4844,6 +4880,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 channel=channel,
                 output_name=build_group_ai_cover_output_name(account_name, channel),
             )
+            if str(channel or "").strip().lower() == "taobao":
+                schedule_ai_image_metadata_sync(account_name)
             with AI_IMAGE_JOBS_LOCK:
                 job = AI_IMAGE_JOBS.get(job_id)
                 if job:

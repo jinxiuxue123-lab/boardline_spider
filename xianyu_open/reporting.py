@@ -380,14 +380,14 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
     ensure_account_ai_copy_support()
     conn = get_connection()
     taobao_account_rows = conn.execute("""
-        SELECT DISTINCT COALESCE(account_name, '') AS account_name
+        SELECT DISTINCT COALESCE(shop_name, '') AS shop_name
         FROM taobao_shops
-        WHERE COALESCE(account_name, '') <> ''
+        WHERE COALESCE(shop_name, '') <> ''
     """).fetchall()
     taobao_account_names = tuple(
-        str(row["account_name"] or "").strip()
+        str(row["shop_name"] or "").strip()
         for row in taobao_account_rows
-        if str(row["account_name"] or "").strip()
+        if str(row["shop_name"] or "").strip()
     )
     df = pd.read_sql_query("""
         SELECT

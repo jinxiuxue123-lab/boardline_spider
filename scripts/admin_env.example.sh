@@ -25,3 +25,10 @@ export PUBLIC_MEDIA_BASE_URL=""
 # 如果后面还要回调，再填这里
 export XIANYU_CALLBACK_PUBLIC_URL=""
 
+# 本地淘宝生图后，是否自动把 AI 图元数据推到服务器
+export AI_SYNC_AUTO_PUSH="0"
+
+# 自动推送目标服务器
+export AI_SYNC_REMOTE_USER="root"
+export AI_SYNC_REMOTE_HOST="47.80.63.228"
+export AI_SYNC_REMOTE_DIR="/root/boardline_spider"
