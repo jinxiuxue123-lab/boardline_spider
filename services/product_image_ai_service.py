@@ -275,6 +275,36 @@ def save_ai_image(product_id: int, ai_main_image_path: str, source_image_path: s
     conn.close()
 
 
+def save_shared_ai_image_alias(product_id: int, ai_main_image_path: str, source_image_path: str, provider: str, model_name: str, prompt_text: str, oss_url: str = "", asset_type: str = "main"):
+    ensure_ai_image_table()
+    conn = get_conn()
+    existing = conn.execute(
+        """
+        SELECT id
+        FROM xianyu_product_ai_images
+        WHERE product_id = ?
+          AND COALESCE(account_name, '') = ''
+          AND COALESCE(asset_type, 'main') = ?
+          AND COALESCE(oss_url, '') = ?
+          AND COALESCE(ai_main_image_path, '') = ?
+        LIMIT 1
+        """,
+        (product_id, asset_type or "main", oss_url or "", ai_main_image_path or ""),
+    ).fetchone()
+    if not existing:
+        conn.execute(
+            """
+            INSERT INTO xianyu_product_ai_images (
+                product_id, account_name, asset_type, ai_main_image_path, oss_url, source_image_path, provider, model_name, prompt_text, is_selected, updated_at
+            )
+            VALUES (?, '', ?, ?, ?, ?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
+            """,
+            (product_id, asset_type or "main", ai_main_image_path, oss_url or "", source_image_path, provider, model_name, prompt_text),
+        )
+        conn.commit()
+    conn.close()
+
+
 def set_selected_ai_images(product_id: int, account_name: str, selected_ids: list[int], asset_type: str = "main"):
     ensure_ai_image_table()
     conn = get_conn()
@@ -1385,6 +1415,17 @@ def generate_ai_main_image(product_id: int, force: bool = True, account_name: st
             account_name=account_name,
             asset_type="main",
         )
+        if normalize_image_channel(channel) == "taobao" and str(account_name or "").strip():
+            save_shared_ai_image_alias(
+                product_id=product_id,
+                ai_main_image_path=str(output_path),
+                oss_url=oss_url,
+                source_image_path=source_image_path,
+                provider=provider,
+                model_name=get_image_model(),
+                prompt_text=prompt_text,
+                asset_type="main",
+            )
     return {
         "product_id": product_id,
         "ai_main_image_path": str(output_path or ""),
@@ -1464,6 +1505,17 @@ def generate_ai_detail_image(product_id: int, force: bool = True, account_name: 
         account_name=account_name,
         asset_type="detail",
     )
+    if normalize_image_channel(channel) == "taobao" and str(account_name or "").strip():
+        save_shared_ai_image_alias(
+            product_id=product_id,
+            ai_main_image_path=str(output_path),
+            oss_url=oss_url,
+            source_image_path=source_image_path,
+            provider=provider,
+            model_name=get_image_model(),
+            prompt_text=prompt_text,
+            asset_type="detail",
+        )
     return {
         "product_id": product_id,
         "ai_main_image_path": str(output_path),

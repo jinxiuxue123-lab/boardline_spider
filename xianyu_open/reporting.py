@@ -187,6 +187,7 @@ def _build_ai_image_map(rows: pd.DataFrame, include_fallback_empty: bool = False
                 items.append({
                     "id": int(row["image_id"]),
                     "path": str(row["ai_main_image_path"] or "").strip(),
+                    "oss_url": str(row["oss_url"] or "").strip(),
                     "selected": int(row["is_selected"] or 0),
                     "account_name": str(row["account_name"] or "").strip(),
                 })
@@ -199,6 +200,7 @@ def _build_ai_image_map(rows: pd.DataFrame, include_fallback_empty: bool = False
             items.append({
                 "id": int(row["image_id"]),
                 "path": str(row["ai_main_image_path"] or "").strip(),
+                "oss_url": str(row["oss_url"] or "").strip(),
                 "selected": int(row["is_selected"] or 0),
                 "account_name": str(row["account_name"] or "").strip(),
             })
@@ -206,10 +208,37 @@ def _build_ai_image_map(rows: pd.DataFrame, include_fallback_empty: bool = False
     return ai_map
 
 
-def _resolve_ai_images(ai_map: dict, product_id: int, account_name: str = "") -> list[dict]:
+def _dedupe_ai_items(items: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for item in items:
+        key = (
+            str(item.get("oss_url") or "").strip(),
+            str(item.get("path") or "").strip(),
+            str(item.get("account_name") or "").strip(),
+            int(item.get("id") or 0),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def _resolve_ai_images(ai_map: dict, product_id: int, account_name: str = "", extra_accounts: tuple[str, ...] | None = None) -> list[dict]:
     normalized_account = str(account_name or "").strip()
+    normalized_extra_accounts = tuple(
+        str(item or "").strip()
+        for item in (extra_accounts or ())
+        if str(item or "").strip()
+    )
     if normalized_account:
-        return ai_map.get((int(product_id), normalized_account), [])
+        primary = ai_map.get((int(product_id), normalized_account), []) or []
+        extras: list[dict] = []
+        for extra_account in normalized_extra_accounts:
+            extras.extend(ai_map.get((int(product_id), extra_account), []) or [])
+        shared = ai_map.get((int(product_id), ""), []) or []
+        return _dedupe_ai_items(primary + extras + shared)
     return ai_map.get(int(product_id), []) or ai_map.get((int(product_id), ""), []) or []
 
 
@@ -315,7 +344,7 @@ def load_task_details(account_name: str = "") -> pd.DataFrame:
     """, conn, params=params)
 
     ai_rows = pd.read_sql_query("""
-        SELECT product_id, COALESCE(account_name, '') AS account_name, id AS image_id, ai_main_image_path, is_selected
+        SELECT product_id, COALESCE(account_name, '') AS account_name, id AS image_id, ai_main_image_path, COALESCE(oss_url, '') AS oss_url, is_selected
         FROM xianyu_product_ai_images
         ORDER BY id DESC
     """, conn)
@@ -350,6 +379,16 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
     ensure_ai_image_table()
     ensure_account_ai_copy_support()
     conn = get_connection()
+    taobao_account_rows = conn.execute("""
+        SELECT DISTINCT COALESCE(account_name, '') AS account_name
+        FROM taobao_shops
+        WHERE COALESCE(account_name, '') <> ''
+    """).fetchall()
+    taobao_account_names = tuple(
+        str(row["account_name"] or "").strip()
+        for row in taobao_account_rows
+        if str(row["account_name"] or "").strip()
+    )
     df = pd.read_sql_query("""
         SELECT
             a.account_name,
@@ -425,29 +464,39 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
         ORDER BY p.category, p.id
     """, conn, params=[account_name])
 
-    ai_rows = pd.read_sql_query("""
+    ai_account_names = [account_name, "", *taobao_account_names]
+    ai_account_names = list(dict.fromkeys(str(item or "").strip() for item in ai_account_names))
+    placeholders = ",".join("?" for _ in ai_account_names)
+    ai_rows = pd.read_sql_query(f"""
         SELECT
             product_id,
             id AS image_id,
             COALESCE(account_name, '') AS account_name,
             ai_main_image_path,
+            COALESCE(oss_url, '') AS oss_url,
             is_selected
         FROM xianyu_product_ai_images
-        WHERE COALESCE(account_name, '') = ?
+        WHERE COALESCE(account_name, '') IN ({placeholders})
         ORDER BY id DESC
-    """, conn, params=[account_name])
+    """, conn, params=ai_account_names)
     conn.close()
     hot_df = load_hot_metrics_df()
 
-    ai_map = _build_ai_image_map(ai_rows)
+    ai_map = _build_ai_image_map(ai_rows, include_fallback_empty=True)
 
     if not df.empty:
         df = df.copy()
         if not hot_df.empty:
             df = df.merge(hot_df, on="product_id", how="left")
-        df["ai_images_json"] = df["product_id"].apply(lambda pid: json.dumps(ai_map.get(int(pid), []), ensure_ascii=False))
+        df["ai_images_json"] = df["product_id"].apply(
+            lambda pid: json.dumps(_resolve_ai_images(ai_map, int(pid), account_name, taobao_account_names), ensure_ascii=False)
+        )
         df["ai_main_image_path"] = df["product_id"].apply(
-            lambda pid: (ai_map.get(int(pid), [{}])[0].get("path", "") if ai_map.get(int(pid)) else "")
+            lambda pid: (
+                _resolve_ai_images(ai_map, int(pid), account_name, taobao_account_names)[0].get("path", "")
+                if _resolve_ai_images(ai_map, int(pid), account_name, taobao_account_names)
+                else ""
+            )
         )
     else:
         df["ai_images_json"] = []

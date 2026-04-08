@@ -692,9 +692,9 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
     normalized_account_name = (account_name or "").strip()
     ai_rows = conn.execute(
         """
-        SELECT product_id, id AS image_id, ai_main_image_path, is_selected, COALESCE(account_name, '') AS account_name, COALESCE(asset_type, 'main') AS asset_type
+        SELECT product_id, id AS image_id, ai_main_image_path, COALESCE(oss_url, '') AS oss_url, is_selected, COALESCE(account_name, '') AS account_name, COALESCE(asset_type, 'main') AS asset_type
         FROM xianyu_product_ai_images
-        WHERE COALESCE(account_name, '') = ?
+        WHERE COALESCE(account_name, '') IN (?, '')
         ORDER BY id DESC
         """,
         (normalized_account_name,),
@@ -709,6 +709,7 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
         item = {
             "id": int(row["image_id"]),
             "path": str(row["ai_main_image_path"] or "").strip(),
+            "oss_url": str(row["oss_url"] or "").strip(),
             "selected": int(row["is_selected"] or 0),
             "account_name": image_account_name,
             "asset_type": str(row["asset_type"] or "main").strip() or "main",
@@ -720,9 +721,29 @@ def load_taobao_product_pool(account_name: str = "") -> sqlite3.Row:
             }
         )
 
+    def merge_ai_images(*groups: list[dict]) -> list[dict]:
+        deduped = []
+        seen = set()
+        for group in groups:
+            for item in group or []:
+                key = (
+                    str(item.get("oss_url") or "").strip(),
+                    str(item.get("path") or "").strip(),
+                    str(item.get("account_name") or "").strip(),
+                    int(item.get("id") or 0),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                deduped.append(item)
+        return deduped
+
     def resolve_ai_images(target_map: dict, product_id: int) -> list[dict]:
         if normalized_account_name:
-            return target_map.get((int(product_id), normalized_account_name), [])
+            return merge_ai_images(
+                target_map.get((int(product_id), normalized_account_name), []) or [],
+                target_map.get((int(product_id), ""), []) or [],
+            )
         return target_map.get((int(product_id), ""), []) or []
 
     import pandas as pd
@@ -2204,6 +2225,17 @@ def local_media_url(path: str) -> str:
     return build_url("/media/local", file_path=path)
 
 
+def ai_media_url(item: dict | None) -> str:
+    item = item or {}
+    oss_url = str(item.get("oss_url") or "").strip()
+    if oss_url.startswith("http://") or oss_url.startswith("https://"):
+        return oss_url
+    image_path = str(item.get("path") or "").strip()
+    if image_path:
+        return local_media_url(image_path)
+    return ""
+
+
 def resolve_local_media_path(path: str) -> str:
     raw_path = str(path or "").strip()
     if not raw_path:
@@ -2370,7 +2402,10 @@ def product_ai_main_image_cell(product_id: int, ai_images_json: str = "", accoun
     parts = []
     for item in ai_images:
         image_id = int(item.get("id") or 0)
-        media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+        raw_media_url = ai_media_url(item)
+        if not raw_media_url:
+            continue
+        media_url = html.escape(raw_media_url)
         checked = " checked" if int(item.get("selected") or 0) == 1 else ""
         parts.append(
             "<div class='thumb-item'>"
@@ -2410,13 +2445,15 @@ def _load_group_ai_gallery(group_id: int, merged_product_ids: str = "", account_
         ai_images = list_ai_images(product_id, account_name=account_name, asset_type="main")
         for item in ai_images:
             image_path = str(item.get("ai_main_image_path") or "").strip()
-            if not image_path:
+            oss_url = str(item.get("oss_url") or "").strip()
+            if not image_path and not oss_url:
                 continue
             items.append(
                 {
                     "type": "member_ai",
                     "label": color_label,
                     "path": image_path,
+                    "oss_url": oss_url,
                     "product_id": product_id,
                     "image_id": int(item.get("id") or 0),
                     "selected": int(item.get("selected") or 0),
@@ -2429,8 +2466,10 @@ def product_ai_detail_cell(product_id: int, ai_images_json: str = "", account_na
     parts = []
     ai_images = _pick_display_ai_images(ai_images_json, account_name)
     for item in ai_images:
-        image_path = str(item.get("path") or "").strip()
-        media_url = html.escape(local_media_url(image_path))
+        raw_media_url = ai_media_url(item)
+        if not raw_media_url:
+            continue
+        media_url = html.escape(raw_media_url)
         parts.append(
             "<div class='thumb-item'>"
             f"<a href='{media_url}' target='_blank' rel='noopener noreferrer'><img class='thumb' src='{media_url}' alt='ai-product'></a>"
@@ -2453,8 +2492,10 @@ def product_image_gallery_cell(product_id: int, remote_url: str, ai_images_json:
 
     for item in _pick_display_ai_images(ai_images_json, account_name):
         image_id = int(item.get("id") or 0)
-        image_path = str(item.get("path") or "").strip()
-        media_url = html.escape(local_media_url(image_path))
+        raw_media_url = ai_media_url(item)
+        if not raw_media_url:
+            continue
+        media_url = html.escape(raw_media_url)
         checked = " checked" if int(item.get("selected") or 0) == 1 else ""
         parts.append(
             "<div class='thumb-item'>"
@@ -2495,10 +2536,10 @@ def batch_task_image_gallery_cell(row) -> str:
         for item in selected_group_images if isinstance(selected_group_images, list) else []:
             if not isinstance(item, dict):
                 continue
-            image_path = str(item.get("path") or "").strip()
-            if not image_path:
+            raw_media_url = ai_media_url(item)
+            if not raw_media_url:
                 continue
-            media_url = html.escape(local_media_url(image_path))
+            media_url = html.escape(raw_media_url)
             label = html.escape(str(item.get("label") or "图片"))
             parts.append(
                 "<div class='thumb-item'>"
@@ -2527,7 +2568,10 @@ def batch_task_image_gallery_cell(row) -> str:
     for item in _load_group_ai_gallery(group_id, merged_product_ids, account_name, "xianyu"):
         if item.get("type") == "group_cover":
             continue
-        media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+        raw_media_url = ai_media_url(item)
+        if not raw_media_url:
+            continue
+        media_url = html.escape(raw_media_url)
         label = html.escape(str(item.get("label") or "AI图"))
         parts.append(
             "<div class='thumb-item'>"
@@ -2547,7 +2591,10 @@ def product_ai_main_image_cell_for_row(row, account_name: str = "", channel: str
         merged_product_ids = str(row.get("merged_product_ids") or "")
         parts = []
         for item in _load_group_ai_gallery(group_id, merged_product_ids, account_name, channel):
-            media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+            raw_media_url = ai_media_url(item)
+            if not raw_media_url:
+                continue
+            media_url = html.escape(raw_media_url)
             label = html.escape(str(item.get("label") or "AI图"))
             if item.get("type") == "member_ai":
                 product_id = int(item.get("product_id") or 0)
@@ -2586,7 +2633,10 @@ def product_image_gallery_cell_for_row(row, account_name: str = "", channel: str
         group_id = int(row.get("merged_group_id") or 0)
         merged_product_ids = str(row.get("merged_product_ids") or "")
         for item in _load_group_ai_gallery(group_id, merged_product_ids, account_name, channel):
-            media_url = html.escape(local_media_url(str(item.get("path") or "").strip()))
+            raw_media_url = ai_media_url(item)
+            if not raw_media_url:
+                continue
+            media_url = html.escape(raw_media_url)
             label = html.escape(str(item.get("label") or "AI图"))
             if item.get("type") == "member_ai":
                 product_id = int(item.get("product_id") or 0)
