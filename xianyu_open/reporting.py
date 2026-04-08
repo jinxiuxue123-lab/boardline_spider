@@ -385,9 +385,9 @@ def load_account_product_pool(account_name: str) -> pd.DataFrame:
         WHERE COALESCE(shop_name, '') <> ''
     """).fetchall()
     taobao_account_names = tuple(
-        str(row["shop_name"] or "").strip()
+        str((row[0] if isinstance(row, tuple) else row["shop_name"]) or "").strip()
         for row in taobao_account_rows
-        if str(row["shop_name"] or "").strip()
+        if str((row[0] if isinstance(row, tuple) else row["shop_name"]) or "").strip()
     )
     df = pd.read_sql_query("""
         SELECT
