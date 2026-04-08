@@ -1314,8 +1314,7 @@ def page_html(title: str, body: str) -> str:
           throw new Error(data.message || "校验上架状态失败");
         }}
         hideProgressMask("上架状态已校验");
-        showResultModal("校验上架状态完成", data.message || "校验完成");
-        window.location.reload();
+        showResultModal("校验上架状态完成", data.message || "校验完成", true);
       }} catch (error) {{
         hideProgressMask("校验上架状态失败");
         showResultModal("校验上架状态失败", `校验上架状态失败\\n${{error && error.message ? error.message : error}}`);

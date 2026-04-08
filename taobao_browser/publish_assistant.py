@@ -259,7 +259,13 @@ def derive_snowboard_variant_data(model: str, stock_text: str) -> tuple[list[str
         if base_length not in seen_lengths:
             seen_lengths.add(base_length)
             lengths.append(base_length)
-        is_wide = bool(re.search(r"\bwide\b|(?<=\d)w\b", label, re.IGNORECASE))
+        is_wide = bool(
+            re.search(
+                r"\bwide\b|(?<=\d)wide\b|(?<=\d)w\b",
+                label,
+                re.IGNORECASE,
+            )
+        )
         color_name = f"{base_model}加宽" if is_wide and base_model else base_model
         color_length_stock_map[(color_name, base_length)] = max(int(qty), 0)
         if is_wide:
