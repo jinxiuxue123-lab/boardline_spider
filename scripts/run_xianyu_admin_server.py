@@ -2263,7 +2263,7 @@ def ai_media_url(item: dict | None) -> str:
     item = item or {}
     oss_url = str(item.get("oss_url") or "").strip()
     if oss_url.startswith("http://") or oss_url.startswith("https://"):
-        return oss_url
+        return build_url("/media/remote", url=oss_url)
     image_path = str(item.get("path") or "").strip()
     if image_path:
         return local_media_url(image_path)
@@ -2296,12 +2296,9 @@ def resolve_local_media_path(path: str) -> str:
 
 def _pick_display_ai_images(ai_images_json: str = "", account_name: str = "") -> list[dict]:
     ai_images = _parse_ai_images(ai_images_json)
-    normalized_account = str(account_name or "").strip()
     if not ai_images:
         return []
-    if not normalized_account:
-        return [item for item in ai_images if not str(item.get("account_name") or "").strip()]
-    return [item for item in ai_images if str(item.get("account_name") or "").strip() == normalized_account]
+    return ai_images
 
 
 def preview_image_cell(remote_url: str, local_ai_path: str = "") -> str:
@@ -2823,6 +2820,41 @@ class AdminHandler(BaseHTTPRequestHandler):
         mime_type, _ = mimetypes.guess_type(resolved.name)
         self.send_response(200)
         self.send_header("Content-Type", mime_type or "application/octet-stream")
+        self.send_header("Content-Disposition", f"inline; filename=\"{resolved.name}\"")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def serve_remote_media(self, params):
+        raw_url = (params.get("url") or [""])[0].strip()
+        if not raw_url:
+            self.send_html("缺少图片", "<div class='card'>缺少远程图片地址</div>", 400)
+            return
+        parsed = urlparse(raw_url)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            self.send_html("无效图片", "<div class='card'>远程图片地址无效</div>", 400)
+            return
+        try:
+            req = Request(
+                raw_url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                },
+            )
+            with urlopen(req, timeout=30) as resp:
+                body = resp.read()
+                mime_type = resp.headers.get_content_type() or mimetypes.guess_type(parsed.path)[0] or "application/octet-stream"
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            self.send_html("图片获取失败", f"<div class='card'>远程图片获取失败：{html.escape(str(exc))}</div>", 502)
+            return
+
+        filename = Path(parsed.path).name or "image"
+        self.send_response(200)
+        self.send_header("Content-Type", mime_type)
+        self.send_header("Content-Disposition", f"inline; filename=\"{filename}\"")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2899,6 +2931,8 @@ class AdminHandler(BaseHTTPRequestHandler):
                 return self.render_account_detail(params)
             if path == "/media/local":
                 return self.serve_local_media(params)
+            if path == "/media/remote":
+                return self.serve_remote_media(params)
             if path == "/batches":
                 return self.render_batches()
             if path == "/batch":
